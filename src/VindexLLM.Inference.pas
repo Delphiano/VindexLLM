@@ -200,6 +200,7 @@ const
 implementation
 
 uses
+  VindexLLM.Model.Ministral3,
   VindexLLM.GGUFReader,
   VindexLLM.Attention,
   VindexLLM.Tokenizer;
@@ -309,7 +310,7 @@ procedure TVdxInference.DownloadLayerCache(const ALayerCache: TVdxGpuBuffer;
 var
   LSize: UInt64;
 begin
-  LSize := FModel.Attn.GetLayerKVCacheTQ3Bytes();
+  LSize := FModel.CacheBytesPerLayer();
   FModel.Compute.CopyBuffer(ALayerCache, AStaging, LSize);
   FModel.Compute.DownloadFromBuffer(AStaging, ACacheBuffer, LSize);
 end;
@@ -319,7 +320,7 @@ procedure TVdxInference.UploadLayerCache(const ALayerCache: TVdxGpuBuffer;
 var
   LSize: UInt64;
 begin
-  LSize := FModel.Attn.GetLayerKVCacheTQ3Bytes();
+  LSize := FModel.CacheBytesPerLayer();
   FModel.Compute.UploadToBuffer(AStaging, ACacheBuffer, LSize);
   FModel.Compute.CopyBuffer(AStaging, ALayerCache, LSize);
 end;
@@ -457,6 +458,8 @@ begin
     UInt64(FModel.VocabSize) * SizeOf(Single) +
     UInt64(FModel.MaxSeqLen) * SizeOf(UInt32);
 
+  if FModel.AllocatedBytes(LVramWeights, LKVTotal, LVramBuffers) then
+    Status('Using actual allocated model buffer sizes');
   FVRAMUsage.WeightsBytes := LVramWeights;
   FVRAMUsage.CacheBytes := LKVTotal;
   FVRAMUsage.BuffersBytes := LVramBuffers;
@@ -491,6 +494,8 @@ var
   LEffectivePrompt: string;
   LReplacement: string;
   LRebuilt: Boolean;
+  LChunkOffset, LChunkCount: Integer;
+  LChunkIds: TArray<Integer>;
 begin
   Result := '';
   FErrors.Clear();
@@ -579,30 +584,34 @@ begin
   try
     // Reset sampler history for this generation
     FSampler.ResetHistory();
+    FModel.Tokenizer.ResetDecoder();
 
     // --- Prefill: batch all prompt tokens through the model ---
     FireEvent(iePrefillStart);
     LPrefillWatch := TStopwatch.StartNew();
 
-    FModel.Compute.BeginBatch();
-    FModel.EmbedTokensBatch(LTokenIds, LTokenCount, FModel.ResidualMatBuffer);
-    for LLayer := 0 to Integer(FModel.NumLayers) - 1 do
+    LChunkOffset := 0;
+    while LChunkOffset < LTokenCount do
     begin
       if IsCancelled() then
       begin
         FStats.StopReason := srCancelled;
         Break;
       end;
-      FModel.RunLayerForwardBatch(LLayer, UInt32(LTokenCount), FCurrentPosition);
+      LChunkCount := Min(FModel.PrefillBatchSize(), LTokenCount - LChunkOffset);
+      LChunkIds := Copy(LTokenIds, LChunkOffset, LChunkCount);
+      FModel.Compute.BeginBatch();
+      try
+        FModel.EmbedTokensBatch(LChunkIds, LChunkCount, FModel.ResidualMatBuffer);
+        for LLayer := 0 to Integer(FModel.NumLayers) - 1 do
+          FModel.RunLayerForwardBatch(LLayer, UInt32(LChunkCount), FCurrentPosition);
+      finally
+        FModel.Compute.EndBatch();
+      end;
+      FCurrentPosition := FCurrentPosition + UInt32(LChunkCount);
+      FModel.SeedResidualFromBatchLast(UInt32(LChunkCount));
+      Inc(LChunkOffset, LChunkCount);
     end;
-    FModel.Compute.EndBatch();
-
-    // Advance write position past the prefilled tokens
-    if FStats.StopReason <> srCancelled then
-      FCurrentPosition := FCurrentPosition + UInt32(LTokenCount);
-
-    // Copy last token's residual from matrix to vector for generation handoff
-    FModel.SeedResidualFromBatchLast(UInt32(LTokenCount));
 
     LPrefillWatch.Stop();
     FireEvent(iePrefillEnd);
@@ -645,8 +654,7 @@ begin
         end;
 
         // Decode token and append to result
-        LTokenStr := FModel.Tokenizer.Decode(
-          TArray<Integer>.Create(LNextTokenId));
+        LTokenStr := FModel.Tokenizer.DecodeToken(LNextTokenId);
         LResult.Append(LTokenStr);
 
         // Track token for repetition penalty
@@ -776,13 +784,14 @@ begin
   FillChar(LHeader, SizeOf(LHeader), 0);
   LHeader.Magic := CVdxKVCacheMagic;
   LHeader.Version := CVdxKVCacheVersion;
+  LHeader.Reserved := FModel.CacheFormat();
   LHeader.NumLayers := FModel.NumLayers;
   LHeader.NumKVHeads := FModel.NumKVHeads;
   LHeader.HeadDim := FModel.HeadDim;
   LHeader.MaxSeqLen := FModel.MaxSeqLen;
   LHeader.CurrentPosition := FCurrentPosition;
 
-  LSize := FModel.Attn.GetLayerKVCacheTQ3Bytes();
+  LSize := FModel.CacheBytesPerLayer();
 
   LStaging := FModel.Compute.CreateGpuBuffer(
     LSize,
@@ -798,11 +807,11 @@ begin
 
           for LLayer := 0 to Integer(FModel.NumLayers) - 1 do
           begin
-            DownloadLayerCache(FModel.Attn.GetLayerKCacheTQ3(LLayer),
+            DownloadLayerCache(FModel.CacheBuffer(LLayer, True),
               LStaging, LLayerBuf);
             LStream.WriteBuffer(LLayerBuf^, LSize);
 
-            DownloadLayerCache(FModel.Attn.GetLayerVCacheTQ3(LLayer),
+            DownloadLayerCache(FModel.CacheBuffer(LLayer, False),
               LStaging, LLayerBuf);
             LStream.WriteBuffer(LLayerBuf^, LSize);
           end;
@@ -847,7 +856,7 @@ begin
     Exit;
   end;
 
-  LSize := FModel.Attn.GetLayerKVCacheTQ3Bytes();
+  LSize := FModel.CacheBytesPerLayer();
   LExpectedPayload := UInt64(FModel.NumLayers) * 2 * LSize;
 
   try
@@ -892,6 +901,12 @@ begin
         FErrors.Add(esError, 'LOAD',
           'Corrupt header: reserved field is nonzero (%d)',
           [LHeader.Reserved]);
+        Exit;
+      end;
+
+      if LHeader.Reserved <> FModel.CacheFormat() then
+      begin
+        FErrors.Add(esError, 'LOAD', 'KV cache format differs from the loaded model');
         Exit;
       end;
 
@@ -959,12 +974,12 @@ begin
 
               // K cache
               LStream.ReadBuffer(LLayerBuf^, LSize);
-              UploadLayerCache(FModel.Attn.GetLayerKCacheTQ3(LLayer),
+              UploadLayerCache(FModel.CacheBuffer(LLayer, True),
                 LStaging, LLayerBuf);
 
               // V cache
               LStream.ReadBuffer(LLayerBuf^, LSize);
-              UploadLayerCache(FModel.Attn.GetLayerVCacheTQ3(LLayer),
+              UploadLayerCache(FModel.CacheBuffer(LLayer, False),
                 LStaging, LLayerBuf);
             end;
 

@@ -50,7 +50,7 @@ begin
   try
     TVdxUtils.Pause('Press any key to start inference...');
 
-    LIndex := 13;
+    LIndex := 14;
 
     case LIndex of
       01: VdxRunTestCase(TVirtualBufferTest);

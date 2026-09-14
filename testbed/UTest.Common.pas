@@ -21,7 +21,8 @@ uses
 const
   // Path to the main inference model — Gemma 3 4B instruction-tuned,
   // Handles text generation for chat responses.
-  CModelPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-q4_0.gguf';
+  //CModelPath = 'C:\Dev\LLM\GGUF\gemma-3-4b-it-q4_0.gguf';
+  CModelPath = 'D:\ministral-3-3b.gguf';
 
   // Path to the embedding model — EmbeddingGemma 300M, Q8_0 quantized.
   // Used by TVdxMemory to embed turns for cosine-similarity vector search.

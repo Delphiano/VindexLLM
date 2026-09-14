@@ -181,7 +181,7 @@ type
     // Tensor access
     function HasTensor(const ATensorName: string): Boolean;
     function GetTensorInfo(const ATensorName: string; out AInfo: TVdxGGUFTensorInfo): Boolean;
-    function GetTensorDataPtr(const ATensorName: string): Pointer;
+    function GetTensorDataPtr(const ATensorName: string; const ARequiredBytes: UInt64 = 0): Pointer;
     function GetTensorList(): TList<TVdxGGUFTensorInfo>;
   end;
 
@@ -851,9 +851,10 @@ begin
   Result := FTensors.TryGetValue(ATensorName, AInfo);
 end;
 
-function TVdxGGUFReader.GetTensorDataPtr(const ATensorName: string): Pointer;
+function TVdxGGUFReader.GetTensorDataPtr(const ATensorName: string; const ARequiredBytes: UInt64): Pointer;
 var
   LInfo: TVdxGGUFTensorInfo;
+  LBaseOffset, LRemaining: UInt64;
 begin
   Result := nil;
 
@@ -871,6 +872,14 @@ begin
     Exit;
   end;
 
+  LBaseOffset := UInt64(FTensorDataBase)-UInt64(FVirtualFile.Memory);
+  if LBaseOffset > FVirtualFile.Size then
+    raise ERangeError.Create('GGUF tensor data base exceeds file size');
+  LRemaining := FVirtualFile.Size-LBaseOffset;
+  if LInfo.DataOffset > LRemaining then
+    raise ERangeError.Create('GGUF tensor offset exceeds file size: '+ATensorName);
+  if ARequiredBytes > LRemaining-LInfo.DataOffset then
+    raise ERangeError.Create('GGUF tensor payload exceeds file size: '+ATensorName);
   // DataOffset is relative to the start of tensor_data
   Result := FTensorDataBase + LInfo.DataOffset;
 end;

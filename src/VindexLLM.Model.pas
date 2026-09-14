@@ -240,11 +240,16 @@ type
     procedure ApplyOutputNormBatch(const ANumTokens: UInt32);
 
     // Embedding helpers
-    procedure EmbedToken(const ATokenId: Integer);
+    procedure EmbedToken(const ATokenId: Integer); virtual;
     procedure EmbedTokensBatch(const ATokenIds: TArray<Integer>;
-      const ANumTokens: Integer; const AOutputBuf: TVdxGpuBuffer);
-    procedure SeedResidualFromBatchLast(const ANumTokens: UInt32);
-    procedure UnembedToLogits(const AOutLogits: TVdxGpuBuffer);
+      const ANumTokens: Integer; const AOutputBuf: TVdxGpuBuffer); virtual;
+    procedure SeedResidualFromBatchLast(const ANumTokens: UInt32); virtual;
+    procedure UnembedToLogits(const AOutLogits: TVdxGpuBuffer); virtual;
+    function PrefillBatchSize(): Integer; virtual;
+    function CacheFormat(): UInt32; virtual;
+    function CacheBytesPerLayer(): UInt64; virtual;
+    function CacheBuffer(const ALayer: Integer; const AKey: Boolean): TVdxGpuBuffer; virtual;
+    function AllocatedBytes(var AWeights, ACache, AScratch: UInt64): Boolean; virtual;
 
     // Factory — reads GGUF arch, resolves via registry, creates instance
     class function LoadModel(const AGGUFPath: string;
@@ -1270,6 +1275,32 @@ begin
   FCompute.EndBatch();
 end;
 
+function TVdxModel.PrefillBatchSize(): Integer;
+begin
+  Result := FMaxSeqLen;
+end;
+
+function TVdxModel.CacheFormat(): UInt32;
+begin
+  Result := 0; // legacy TQ3 snapshot format
+end;
+
+function TVdxModel.CacheBytesPerLayer(): UInt64;
+begin
+  Result := FAttn.GetLayerKVCacheTQ3Bytes();
+end;
+
+function TVdxModel.CacheBuffer(const ALayer: Integer; const AKey: Boolean): TVdxGpuBuffer;
+begin
+  if AKey then Result := FAttn.GetLayerKCacheTQ3(ALayer)
+  else Result := FAttn.GetLayerVCacheTQ3(ALayer);
+end;
+
+function TVdxModel.AllocatedBytes(var AWeights, ACache, AScratch: UInt64): Boolean;
+begin
+  Result := False;
+end;
+
 // --- Factory ---
 
 class function TVdxModel.LoadModel(const AGGUFPath: string;
@@ -1319,6 +1350,7 @@ begin
   if Assigned(AStatusCallback) then
     Result.SetStatusCallback(AStatusCallback, AStatusUserData);
 
+  try
   // Lifecycle: LoadModelConfig → InitSubsystems → LoadWeights
   if not Result.LoadModelConfig(LReader, AMaxContext) then
   begin
@@ -1341,6 +1373,10 @@ begin
   end;
 
   Result.Status('Model loaded successfully (%s)', [LArch]);
+  except
+    FreeAndNil(Result);
+    raise;
+  end;
 end;
 
 end.

@@ -59,7 +59,8 @@ uses
   VindexLLM.VirtualBuffer in '..\src\VindexLLM.VirtualBuffer.pas',
   VindexLLM.VirtualFile in '..\src\VindexLLM.VirtualFile.pas',
   VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas',
-  VindexLLM.Common in '..\src\VindexLLM.Common.pas';
+  VindexLLM.Common in '..\src\VindexLLM.Common.pas',
+  VindexLLM.Model.Ministral3 in '..\src\VindexLLM.Model.Ministral3.pas';
 
 begin
   RunVdxTestbed();
