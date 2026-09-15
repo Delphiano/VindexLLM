@@ -362,8 +362,17 @@ begin
   end;
 
   // Create model via factory
-  FModel := TVdxModel.LoadModel(AGGUFPath, AMaxContext,
-    FStatusCallback.Callback, FStatusCallback.UserData);
+  try
+    FModel := TVdxModel.LoadModel(AGGUFPath, AMaxContext,
+      FStatusCallback.Callback, FStatusCallback.UserData, FErrors);
+  except
+    on E: Exception do
+    begin
+      FErrors.Clear();
+      FErrors.Add(esFatal, 'LOAD', '%s', [E.Message]);
+      Exit;
+    end;
+  end;
   if FModel = nil then
   begin
     FErrors.Add(esFatal, 'LOAD', 'TVdxModel.LoadModel returned nil for: %s',
@@ -498,13 +507,18 @@ var
   LChunkIds: TArray<Integer>;
 begin
   Result := '';
-  FErrors.Clear();
 
   if not FModelLoaded then
   begin
     FErrors.Add(esError, 'GEN', 'Model not loaded');
     Exit;
   end;
+  if (FModel = nil) or not FModel.Compute.IsReady() then
+  begin
+    FErrors.Add(esFatal, 'GEN', 'GPU unavailable after a failure; unload and reload the model');
+    Exit;
+  end;
+  FErrors.Clear();
 
   // Lazy rebuild: if the cache has crossed the configured threshold and a
   // handler is installed, give it a chance to return a replacement prompt.

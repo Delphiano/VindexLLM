@@ -23,6 +23,8 @@ uses
 
 type
 
+  EVdxVulkanError = class(Exception);
+
 
   { TVdxGpuDeviceType }
   TVdxGpuDeviceType = (
@@ -99,6 +101,8 @@ type
     FCommandPool:       VkCommandPool;
     FCommandBuffer:     VkCommandBuffer;
     FFence:             VkFence;
+    FReady:             Boolean;
+    FFailure:           string;
 
     // Batch mode — records multiple dispatches into one command buffer submission
     FBatchMode: Boolean;
@@ -182,6 +186,10 @@ type
     function  FindMemoryType(const ATypeBits: UInt32; const AProperties: VkFlags): UInt32;
     function  GetVkProc(const AName: PAnsiChar): Pointer;
     function  CheckVk(const AResult: VkResult; const AContext: string): Boolean;
+    procedure Fail(const AMessage: string);
+    procedure RequireReady();
+    procedure ValidateBuffer(const ABuffer: TVdxGpuBuffer;
+      const AOffset, ASize: VkDeviceSize; const AOperation: string);
 
   public
     constructor Create(); override;
@@ -194,6 +202,7 @@ type
     //   -1 (default) — auto: prefer discrete, fall back to first compute-capable
     //   >= 0         — explicit index from EnumerateGpus
     procedure Init(const AGpuIndex: Integer = -1);
+    function IsReady(): Boolean;
 
     // Buffer operations
     function  CreateGpuBuffer(const ASize: VkDeviceSize; const AUsage: VkFlags; const AMemProps: VkFlags): TVdxGpuBuffer;
@@ -270,6 +279,9 @@ end;
 
 procedure TVdxCompute.Init(const AGpuIndex: Integer);
 begin
+  if (FDevice <> nil) or (FFailure <> '') then
+    raise EVdxVulkanError.Create('Create a new compute instance before initializing again');
+  FReady := False;
   Status('Loading Vulkan...');
   LoadVulkanLibrary();
   if FErrors.HasErrors() then Exit;
@@ -282,6 +294,7 @@ begin
   if FErrors.HasErrors() then Exit;
 
   LoadInstanceFunctions();
+  if FErrors.HasErrors() then Exit;
 
   Status('Selecting GPU...');
   SelectPhysicalDevice(AGpuIndex);
@@ -292,33 +305,41 @@ begin
   if FErrors.HasErrors() then Exit;
 
   LoadDeviceFunctions();
+  if FErrors.HasErrors() then Exit;
   FvkGetDeviceQueue(FDevice, FComputeQueueFamily, 0, FComputeQueue);
 
   Status('Creating command resources...');
   CreateCommandResources();
   if FErrors.HasErrors() then Exit;
 
+  FReady := True;
   Status('Vulkan ready: %s (%d MB VRAM)', [GetDeviceName(), GetVRAMSizeMB()]);
 end;
 
 destructor TVdxCompute.Destroy();
+var I: Integer;
 begin
+  FReady := False;
   if FDevice <> nil then
   begin
     // Wait for GPU to finish before cleanup
-    if Assigned(FvkQueueWaitIdle) then
+    if Assigned(FvkQueueWaitIdle) and (FComputeQueue <> nil) then
       FvkQueueWaitIdle(FComputeQueue);
 
-    if FFence <> VK_NULL_HANDLE then
+    if Assigned(FvkDestroyDescriptorPool) then
+      for I := 0 to FBatchDeferredPoolCount - 1 do
+        FvkDestroyDescriptorPool(FDevice, FBatchDeferredPools[I], nil);
+
+    if (FFence <> VK_NULL_HANDLE) and Assigned(FvkDestroyFence) then
       FvkDestroyFence(FDevice, FFence, nil);
 
-    if FCommandPool <> VK_NULL_HANDLE then
+    if (FCommandPool <> VK_NULL_HANDLE) and Assigned(FvkDestroyCommandPool) then
       FvkDestroyCommandPool(FDevice, FCommandPool, nil);
 
-    FvkDestroyDevice(FDevice, nil);
+    if Assigned(FvkDestroyDevice) then FvkDestroyDevice(FDevice, nil);
   end;
 
-  if FInstance <> nil then
+  if (FInstance <> nil) and Assigned(FvkDestroyInstance) then
     FvkDestroyInstance(FInstance, nil);
 
   if FLibHandle <> 0 then
@@ -429,10 +450,53 @@ begin
 end;
 
 function TVdxCompute.CheckVk(const AResult: VkResult; const AContext: string): Boolean;
+var LName: string;
 begin
   Result := (AResult = VK_SUCCESS);
   if not Result then
-    FErrors.Add(esError, 'VULKAN', '%s failed (VkResult=%d)', [AContext, Ord(AResult)]);
+  begin
+    case AResult of
+      VK_ERROR_OUT_OF_HOST_MEMORY: LName := 'VK_ERROR_OUT_OF_HOST_MEMORY';
+      VK_ERROR_OUT_OF_DEVICE_MEMORY: LName := 'VK_ERROR_OUT_OF_DEVICE_MEMORY';
+      VK_ERROR_DEVICE_LOST: LName := 'VK_ERROR_DEVICE_LOST';
+      VK_ERROR_MEMORY_MAP_FAILED: LName := 'VK_ERROR_MEMORY_MAP_FAILED';
+      VK_ERROR_FEATURE_NOT_PRESENT: LName := 'VK_ERROR_FEATURE_NOT_PRESENT';
+      VK_ERROR_TOO_MANY_OBJECTS: LName := 'VK_ERROR_TOO_MANY_OBJECTS';
+    else LName := 'Vulkan failure';
+    end;
+    Fail(Format('%s: %s (VkResult=%d, GPU=%s)',
+      [AContext, LName, AResult, GetDeviceName()]));
+  end;
+end;
+
+procedure TVdxCompute.Fail(const AMessage: string);
+begin
+  FReady := False;
+  if FFailure = '' then FFailure := AMessage;
+  FErrors.Add(esFatal, 'VULKAN', AMessage);
+  raise EVdxVulkanError.Create(AMessage);
+end;
+
+function TVdxCompute.IsReady(): Boolean;
+begin
+  Result := FReady and (FFailure = '');
+end;
+
+procedure TVdxCompute.RequireReady();
+begin
+  if FFailure <> '' then raise EVdxVulkanError.Create(FFailure);
+  if not FReady then Fail('Vulkan device is not initialized; model loading must succeed before use');
+end;
+
+procedure TVdxCompute.ValidateBuffer(const ABuffer: TVdxGpuBuffer;
+  const AOffset, ASize: VkDeviceSize; const AOperation: string);
+begin
+  RequireReady();
+  if (ABuffer.Buffer = VK_NULL_HANDLE) or (ABuffer.Memory = VK_NULL_HANDLE) then
+    Fail(AOperation + ': buffer has no allocated and bound memory');
+  if (AOffset > ABuffer.Size) or (ASize > ABuffer.Size - AOffset) then
+    Fail(Format('%s: range exceeds buffer (offset=%d, bytes=%d, size=%d)',
+      [AOperation, AOffset, ASize, ABuffer.Size]));
 end;
 
 procedure TVdxCompute.CreateVkInstance();
@@ -651,17 +715,17 @@ end;
 
 function TVdxCompute.FindMemoryType(const ATypeBits: UInt32; const AProperties: VkFlags): UInt32;
 var
-  LI: UInt32;
+  LI: Integer;
 begin
   Result := 0;
-  for LI := 0 to FMemoryProperties.memoryTypeCount - 1 do
+  for LI := 0 to Integer(FMemoryProperties.memoryTypeCount) - 1 do
   begin
     if ((ATypeBits and (1 shl LI)) <> 0) and
        ((FMemoryProperties.memoryTypes[LI].propertyFlags and AProperties) = AProperties) then
       Exit(LI);
   end;
 
-  FErrors.Add(esError, 'VULKAN_MEM', 'No suitable memory type found (bits=$%x, props=$%x)', [ATypeBits, AProperties]);
+  Fail(Format('No suitable memory type found (bits=$%x, props=$%x)', [ATypeBits, AProperties]));
 end;
 
 function TVdxCompute.CreateGpuBuffer(const ASize: VkDeviceSize; const AUsage: VkFlags; const AMemProps: VkFlags): TVdxGpuBuffer;
@@ -671,8 +735,10 @@ var
   LAllocInfo: VkMemoryAllocateInfo;
 begin
   FillChar(Result, SizeOf(Result), 0);
+  RequireReady();
+  if ASize = 0 then Fail('CreateGpuBuffer: size must be greater than zero');
   Result.Size := ASize;
-
+  try
   // Create buffer
   FillChar(LBufInfo, SizeOf(LBufInfo), 0);
   LBufInfo.sType := VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -689,10 +755,16 @@ begin
   LAllocInfo.sType := VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   LAllocInfo.allocationSize := LMemReqs.size;
   LAllocInfo.memoryTypeIndex := FindMemoryType(LMemReqs.memoryTypeBits, AMemProps);
-  if not CheckVk(FvkAllocateMemory(FDevice, LAllocInfo, nil, Result.Memory), 'vkAllocateMemory') then Exit;
+  CheckVk(FvkAllocateMemory(FDevice, LAllocInfo, nil, Result.Memory),
+    Format('vkAllocateMemory (bytes=%d, memoryType=%d, properties=$%x)',
+      [LAllocInfo.allocationSize, LAllocInfo.memoryTypeIndex, AMemProps]));
 
   // Bind buffer to memory
   if not CheckVk(FvkBindBufferMemory(FDevice, Result.Buffer, Result.Memory, 0), 'vkBindBufferMemory') then Exit;
+  except
+    DestroyGpuBuffer(Result);
+    raise;
+  end;
 end;
 
 procedure TVdxCompute.DestroyGpuBuffer(var ABuffer: TVdxGpuBuffer);
@@ -710,22 +782,38 @@ procedure TVdxCompute.UploadToBuffer(const ABuffer: TVdxGpuBuffer; const AData: 
 var
   LMapped: Pointer;
 begin
+  ValidateBuffer(ABuffer, 0, ASize, 'UploadToBuffer');
+  if ASize = 0 then Exit;
+  if AData = nil then Fail('UploadToBuffer: source pointer is nil');
+  LMapped := nil;
   if not CheckVk(FvkMapMemory(FDevice, ABuffer.Memory, 0, ASize, 0, LMapped), 'vkMapMemory') then Exit;
-  Move(AData^, LMapped^, ASize);
-  FvkUnmapMemory(FDevice, ABuffer.Memory);
+  try
+    Move(AData^, LMapped^, ASize);
+  finally
+    FvkUnmapMemory(FDevice, ABuffer.Memory);
+  end;
 end;
 
 procedure TVdxCompute.DownloadFromBuffer(const ABuffer: TVdxGpuBuffer; const AData: Pointer; const ASize: VkDeviceSize);
 var
   LMapped: Pointer;
 begin
+  ValidateBuffer(ABuffer, 0, ASize, 'DownloadFromBuffer');
+  if ASize = 0 then Exit;
+  if AData = nil then Fail('DownloadFromBuffer: destination pointer is nil');
+  LMapped := nil;
   if not CheckVk(FvkMapMemory(FDevice, ABuffer.Memory, 0, ASize, 0, LMapped), 'vkMapMemory') then Exit;
-  Move(LMapped^, AData^, ASize);
-  FvkUnmapMemory(FDevice, ABuffer.Memory);
+  try
+    Move(LMapped^, AData^, ASize);
+  finally
+    FvkUnmapMemory(FDevice, ABuffer.Memory);
+  end;
 end;
 
 function TVdxCompute.MapBufferPersistent(const ABuffer: TVdxGpuBuffer): Pointer;
 begin
+  Result := nil;
+  ValidateBuffer(ABuffer, 0, ABuffer.Size, 'MapBufferPersistent');
   if not CheckVk(FvkMapMemory(FDevice, ABuffer.Memory, 0, ABuffer.Size, 0, Result), 'vkMapMemory(persistent)') then Exit;
 end;
 
@@ -738,6 +826,8 @@ function TVdxCompute.CreateShaderModule(const ACode: Pointer; const ACodeSize: N
 var
   LCreateInfo: VkShaderModuleCreateInfo;
 begin
+  RequireReady();
+  Result := VK_NULL_HANDLE;
   FillChar(LCreateInfo, SizeOf(LCreateInfo), 0);
   LCreateInfo.sType := VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
   LCreateInfo.codeSize := ACodeSize;
@@ -760,6 +850,8 @@ begin
   FillChar(Result, SizeOf(Result), 0);
 
   // Pipeline layout
+  RequireReady();
+  try
   FillChar(LLayoutInfo, SizeOf(LLayoutInfo), 0);
   LLayoutInfo.sType := VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   LLayoutInfo.setLayoutCount := 1;
@@ -779,6 +871,10 @@ begin
   LPipelineInfo.stage := LStageInfo;
   LPipelineInfo.layout := Result.PipelineLayout;
   if not CheckVk(FvkCreateComputePipelines(FDevice, VK_NULL_HANDLE, 1, LPipelineInfo, nil, @Result.Pipeline), 'vkCreateComputePipelines') then Exit;
+  except
+    DestroyComputePipelineBundle(Result);
+    raise;
+  end;
 end;
 
 function TVdxCompute.CreateComputePipelineWithPush(const AShaderModule: VkShaderModule; const AEntryPoint: PAnsiChar; const ADescSetLayout: VkDescriptorSetLayout; const APushSize: UInt32): TVdxComputePipelineBundle;
@@ -791,6 +887,8 @@ begin
   FillChar(Result, SizeOf(Result), 0);
 
   // Push constant range for compute stage
+  RequireReady();
+  try
   FillChar(LPushRange, SizeOf(LPushRange), 0);
   LPushRange.stageFlags := VK_SHADER_STAGE_COMPUTE_BIT;
   LPushRange.offset := 0;
@@ -818,6 +916,10 @@ begin
   LPipelineInfo.stage := LStageInfo;
   LPipelineInfo.layout := Result.PipelineLayout;
   if not CheckVk(FvkCreateComputePipelines(FDevice, VK_NULL_HANDLE, 1, LPipelineInfo, nil, @Result.Pipeline), 'vkCreateComputePipelines') then Exit;
+  except
+    DestroyComputePipelineBundle(Result);
+    raise;
+  end;
 end;
 
 function TVdxCompute.CreateComputePipelineWithPushAndSpec(
@@ -835,6 +937,8 @@ var
   LSpecInfo: VkSpecializationInfo;
 begin
   Result := Default(TVdxComputePipelineBundle);
+  RequireReady();
+  try
 
   // Specialization constant: single UInt32 at constant_id = 0
   LSpecEntry := Default(VkSpecializationMapEntry);
@@ -877,6 +981,10 @@ begin
   LPipelineInfo.stage := LStageInfo;
   LPipelineInfo.layout := Result.PipelineLayout;
   if not CheckVk(FvkCreateComputePipelines(FDevice, VK_NULL_HANDLE, 1, LPipelineInfo, nil, @Result.Pipeline), 'vkCreateComputePipelines') then Exit;
+  except
+    DestroyComputePipelineBundle(Result);
+    raise;
+  end;
 end;
 
 procedure TVdxCompute.DestroyComputePipelineBundle(var ABundle: TVdxComputePipelineBundle);
@@ -896,6 +1004,8 @@ var
   LCreateInfo: VkDescriptorSetLayoutCreateInfo;
   LI: UInt32;
 begin
+  RequireReady();
+  Result := VK_NULL_HANDLE;
   SetLength(LBindings, ABindingCount);
 
   for LI := 0 to ABindingCount - 1 do
@@ -920,6 +1030,8 @@ var
   LPoolSize: VkDescriptorPoolSize;
   LCreateInfo: VkDescriptorPoolCreateInfo;
 begin
+  RequireReady();
+  Result := VK_NULL_HANDLE;
   LPoolSize.descriptorType := VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   LPoolSize.descriptorCount := AMaxDescriptors;
 
@@ -939,6 +1051,10 @@ var
   LWrites: array of VkWriteDescriptorSet;
   LI: Integer;
 begin
+  RequireReady();
+  Result := VK_NULL_HANDLE;
+  for LI := 0 to High(ABuffers) do
+    ValidateBuffer(ABuffers[LI], 0, ABuffers[LI].Size, 'AllocateDescriptorSetForBuffers');
   // Allocate the set
   FillChar(LAllocInfo, SizeOf(LAllocInfo), 0);
   LAllocInfo.sType := VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -975,6 +1091,9 @@ var
   LWrites: array of VkWriteDescriptorSet;
   LI: Integer;
 begin
+  RequireReady();
+  for LI := 0 to High(ABuffers) do
+    ValidateBuffer(ABuffers[LI], 0, ABuffers[LI].Size, 'UpdateDescriptorSetBuffers');
   SetLength(LBufferInfos, Length(ABuffers));
   SetLength(LWrites, Length(ABuffers));
 
@@ -1001,6 +1120,9 @@ var
   LBeginInfo: VkCommandBufferBeginInfo;
   LSubmitInfo: VkSubmitInfo;
 begin
+  RequireReady();
+  if (APipeline = 0) or (APipelineLayout = 0) or (ADescSet = 0) then
+    Fail('DispatchCompute: invalid pipeline or descriptor set');
   if not FBatchMode then
   begin
     // Non-batch: full begin → record → end → submit → fence cycle
@@ -1035,6 +1157,9 @@ var
   LBeginInfo: VkCommandBufferBeginInfo;
   LSubmitInfo: VkSubmitInfo;
 begin
+  RequireReady();
+  if (APipeline = 0) or (APipelineLayout = 0) or (ADescSet = 0) then
+    Fail('DispatchComputeWithPush: invalid pipeline or descriptor set');
   if not FBatchMode then
   begin
     FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
@@ -1068,6 +1193,9 @@ var
   LCopyRegion: VkBufferCopy;
   LSubmitInfo: VkSubmitInfo;
 begin
+  ValidateBuffer(ASrc, 0, ASize, 'CopyBuffer source');
+  ValidateBuffer(ADst, 0, ASize, 'CopyBuffer destination');
+  if ASize = 0 then Exit;
   if not FBatchMode then
   begin
     FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
@@ -1104,6 +1232,9 @@ var
   LCopyRegion: VkBufferCopy;
   LSubmitInfo: VkSubmitInfo;
 begin
+  ValidateBuffer(ASrc, ASrcOffset, ASize, 'CopyBufferRegion source');
+  ValidateBuffer(ADst, ADstOffset, ASize, 'CopyBufferRegion destination');
+  if ASize = 0 then Exit;
   if not FBatchMode then
   begin
     FillChar(LBeginInfo, SizeOf(LBeginInfo), 0);
@@ -1163,6 +1294,7 @@ procedure TVdxCompute.BeginBatch();
 var
   LBeginInfo: VkCommandBufferBeginInfo;
 begin
+  RequireReady();
   if FBatchMode then
   begin
     FErrors.Add(esError, 'VULKAN_BATCH', 'BeginBatch called while already in batch mode');
@@ -1183,6 +1315,11 @@ var
   LSubmitInfo: VkSubmitInfo;
   LI: Integer;
 begin
+  if not IsReady() then
+  begin
+    FBatchMode := False;
+    Exit;
+  end;
   if not FBatchMode then
   begin
     FErrors.Add(esError, 'VULKAN_BATCH', 'EndBatch called without BeginBatch');

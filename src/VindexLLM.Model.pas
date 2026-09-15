@@ -255,7 +255,8 @@ type
     class function LoadModel(const AGGUFPath: string;
       const AMaxContext: Integer;
       const AStatusCallback: TVdxStatusCallback = nil;
-      const AStatusUserData: Pointer = nil): TVdxModel;
+      const AStatusUserData: Pointer = nil;
+      const AErrors: TVdxErrors = nil): TVdxModel;
 
     // Accessors
     property Architecture: string read FArchitecture;
@@ -547,6 +548,8 @@ begin
     begin
       FErrors.Add(esFatal, 'LOAD',
         'Exception uploading norm "%s": %s', [ATensorName, E.Message]);
+      FCompute.DestroyGpuBuffer(Result);
+      raise;
     end;
   end;
 end;
@@ -558,6 +561,8 @@ var
   LSize: UInt64;
   LStaging: TVdxGpuBuffer;
 begin
+  FillChar(Result, SizeOf(Result), 0);
+  FillChar(LStaging, SizeOf(LStaging), 0);
   if not FReader.GetTensorInfo(ATensorName, LInfo) then
   begin
     FErrors.Add(esFatal, 'LOAD',
@@ -586,6 +591,9 @@ begin
     Exit;
   end;
 
+  LPtr := FReader.GetTensorDataPtr(ATensorName, LSize);
+  if LPtr = nil then raise Exception.CreateFmt('Invalid tensor data: %s', [ATensorName]);
+  try
   LStaging := FCompute.CreateGpuBuffer(LSize,
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -597,6 +605,14 @@ begin
     FCompute.CopyBuffer(LStaging, Result, LSize);
   finally
     FCompute.DestroyGpuBuffer(LStaging);
+  end;
+  except
+    on E: Exception do
+    begin
+      FCompute.DestroyGpuBuffer(Result);
+      raise Exception.CreateFmt('UploadWeightTensor("%s", %d bytes): %s',
+        [ATensorName, LSize, E.Message]);
+    end;
   end;
 end;
 
@@ -1306,7 +1322,8 @@ end;
 class function TVdxModel.LoadModel(const AGGUFPath: string;
   const AMaxContext: Integer;
   const AStatusCallback: TVdxStatusCallback;
-  const AStatusUserData: Pointer): TVdxModel;
+  const AStatusUserData: Pointer;
+  const AErrors: TVdxErrors): TVdxModel;
 var
   LReader: TVdxGGUFReader;
   LArch: string;
@@ -1317,6 +1334,7 @@ begin
 
   // Open GGUF and detect architecture
   LReader := TVdxGGUFReader.Create();
+  if AErrors <> nil then LReader.SetErrors(AErrors);
   if Assigned(AStatusCallback) then
     LReader.SetStatusCallback(AStatusCallback, AStatusUserData);
 
@@ -1344,6 +1362,7 @@ begin
 
   // Create concrete instance
   Result := LModelClass.Create();
+  if AErrors <> nil then Result.SetErrors(AErrors);
   Result.FArchitecture := LArch;
   Result.FGGUFPath := AGGUFPath;
 
@@ -1352,7 +1371,7 @@ begin
 
   try
   // Lifecycle: LoadModelConfig → InitSubsystems → LoadWeights
-  if not Result.LoadModelConfig(LReader, AMaxContext) then
+  if not Result.LoadModelConfig(LReader, AMaxContext) or Result.GetErrors().HasErrors() then
   begin
     // If inherited ran, FReader is set and destructor handles cleanup.
     // If it didn't, reader is leaked — but inherited always succeeds.
@@ -1360,13 +1379,13 @@ begin
     Exit;
   end;
 
-  if not Result.InitSubsystems() then
+  if not Result.InitSubsystems() or Result.GetErrors().HasErrors() then
   begin
     FreeAndNil(Result);
     Exit;
   end;
 
-  if not Result.LoadWeights() then
+  if not Result.LoadWeights() or Result.GetErrors().HasErrors() then
   begin
     FreeAndNil(Result);
     Exit;
