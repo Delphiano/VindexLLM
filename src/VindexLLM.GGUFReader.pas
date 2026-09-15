@@ -289,6 +289,12 @@ begin
       Result := LNumBlocks * 34;
     end;
 
+    11: // Q3_K: block_size=256, block_bytes=110 (32 hmask + 64 qs + 12 scales + 2 d)
+    begin
+      LNumBlocks := LTotalElements div 256;
+      Result := LNumBlocks * 110;
+    end;
+
     12: // Q4_K: block_size=256, block_bytes=144 (2+2 scale/min + 12 sub-scales + 128 qs)
     begin
       LNumBlocks := LTotalElements div 256;

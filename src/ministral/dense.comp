@@ -29,6 +29,18 @@ float weight(uint row,uint col) {
   uint off=(e/32)*34, q=byteA(off+2+e%32);
   return halfA(off)*float(int(q>=128?q-256:q));
  }
+ // Q3_K: 256 values / 110 bytes.  Each 16-value sub-block has a
+ // signed 6-bit scale; values are 2 low bits plus a separately packed bit.
+ if(p.typ==11) {
+  uint off=(e/256)*110, i=e%256, sub=i/16;
+  uint lo=sub<8 ? (byteA(off+96+sub)&15) : ((byteA(off+96+sub-8)>>4)&15);
+  uint hi=(byteA(off+104+(sub%4))>>(2*(sub/4)))&3;
+  int scale=int(lo|(hi<<4))-32;
+  uint segment=i/128, pair=(i%128)/32, lane=i%16, side=(i%32)/16;
+  uint q=(byteA(off+32+segment*32+side*16+lane)>>(2*pair))&3;
+  bool high=(byteA(off+side*16+lane)&(uint(1)<<(segment*4+pair)))!=0;
+  return halfA(off+108)*float(scale)*float(int(q)-(high?0:4));
+ }
  // Q6_K: 256 values / 210 bytes. Scale bytes are signed int8.
  uint off=(e/256)*210, j=e%32, h=(e%256)/128, quadrant=(e%128)/32;
  uint lo=(byteA(off+h*64+j+(quadrant%2)*32) >> (quadrant>=2?4:0))&15;

@@ -13,7 +13,7 @@ def case(name,op,a,b,expected,groups,**kw):
  (out/(name+'.case')).write_bytes(struct.pack('<7I',*groups,*map(len,arrays))+push+b''.join(arrays))
  expected.astype('<f4').tofile(out/(name+'.expected'))
 # Actual GGML layouts, with independent vectorized dequantization.
-for kind,block,size in [(0,1,4),(1,1,2),(2,32,18),(3,32,20),(8,32,34),(14,256,210)]:
+for kind,block,size in [(0,1,4),(1,1,2),(2,32,18),(3,32,20),(8,32,34),(11,256,110),(14,256,210)]:
  width=512;rows=5;tokens=3;nb=width*rows//block
  if kind in (0,1):
   raw=rng.normal(size=(rows,width)).astype('<f4' if kind==0 else '<f2');w=raw.astype('float32')
@@ -27,6 +27,22 @@ for kind,block,size in [(0,1,4),(1,1,2),(2,32,18),(3,32,20),(8,32,34),(14,256,21
    else:
     qs=raw[:,2 if kind==2 else 4:];q=np.concatenate([qs&15,qs>>4],axis=1).astype('float32')
     w=ds.astype('float32')[:,None]*(q-8) if kind==2 else ds.astype('float32')[:,None]*q+mins.astype('float32')[:,None]
+  elif kind==11:
+   raw[:,:32]=rng.integers(0,256,(nb,32),dtype='uint8')
+   raw[:,32:96]=rng.integers(0,256,(nb,64),dtype='uint8')
+   raw[:,96:108]=rng.integers(0,256,(nb,12),dtype='uint8')
+   raw[:,108:110]=ds.view('uint8').reshape(nb,2)
+   w=np.empty((nb,256),'float32')
+   for sub in range(16):
+    low=(raw[:,96+sub]&15) if sub<8 else (raw[:,96+sub-8]>>4)
+    high=(raw[:,104+sub%4]>>(2*(sub//4)))&3
+    scale=low.astype('int8')+(high.astype('int8')<<4)-32
+    half=sub//8;pair=(sub%8)//2;side=sub%2
+    qs=raw[:,32+half*32+side*16:32+half*32+(side+1)*16]
+    hm=raw[:,side*16:(side+1)*16]
+    q=(qs>>(2*pair))&3
+    signed=q.astype('int8')-np.where(hm&(1<<(half*4+pair)),0,4)
+    w[:,sub*16:(sub+1)*16]=ds.astype('float32')[:,None]*scale[:,None]*signed
   else:
    raw[:,208:210]=ds.view('uint8').reshape(nb,2)
    lo=raw[:,:128];hi=raw[:,128:192];sc=raw[:,192:208].view('int8');w=np.empty((nb,256),'float32')

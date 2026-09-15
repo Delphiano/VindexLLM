@@ -224,7 +224,7 @@ begin
   end
   else if (Info.NumDimensions <> 2) or (Info.Dimensions[1] <> ARows) then
     raise EConvertError.Create('Incorrect tensor shape: '+AName);
-  if not (Info.TensorType in [gtF32,gtF16,gtQ4_0,gtQ4_1,gtQ8_0,gtQ6_K]) then
+  if not (Info.TensorType in [gtF32,gtF16,gtQ4_0,gtQ4_1,gtQ8_0,gtQ3_K,gtQ6_K]) then
     raise ENotSupportedException.CreateFmt('Unsupported tensor %s: %s',[AName,VdxGGMLTypeName(Info.TensorType)]);
   N := VdxGGMLTensorBytes(Info.TensorType,AWidth,ARows);
   Data := FReader.GetTensorDataPtr(AName,N);
