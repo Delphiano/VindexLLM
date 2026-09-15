@@ -353,7 +353,7 @@ type
       const AHiddenDim: UInt32; const ANumQHeads: UInt32;
       const ANumKVHeads: UInt32; const AHeadDim: UInt32;
       const ANumLayers: UInt32; const AMaxSeqLen: UInt32;
-      const AFFNWidth: UInt32);
+      const AFFNWidth: UInt32; const APrefillCapacity: UInt32 = 0);
 
     // Release all GPU resources
     procedure Cleanup();
@@ -560,12 +560,13 @@ procedure TVdxAttention.Init(const ACompute: TVdxCompute;
   const AHiddenDim: UInt32; const ANumQHeads: UInt32;
   const ANumKVHeads: UInt32; const AHeadDim: UInt32;
   const ANumLayers: UInt32; const AMaxSeqLen: UInt32;
-  const AFFNWidth: UInt32);
+  const AFFNWidth: UInt32; const APrefillCapacity: UInt32);
 var
   LI: Integer;
   LCacheSize: UInt64;
   LDummyBuf: TVdxGpuBuffer;
   LMaxQ8Blocks: UInt32;
+  LPrefillCapacity: UInt32;
 begin
   FCompute := ACompute;
   FHiddenDim := AHiddenDim;
@@ -795,9 +796,11 @@ begin
     FPrefillDescPool, FAttnValueDescLayout,
     [LDummyBuf, LDummyBuf, LDummyBuf]);
 
-  // Pre-allocated prefill scores buffer [NumQHeads x MaxSeq x MaxSeq] F32
+  LPrefillCapacity := APrefillCapacity;
+  if LPrefillCapacity = 0 then LPrefillCapacity := FMaxSeqLen;
+  // Queries are chunked; keys still span the entire context.
   FPrefillScoresBuf := FCompute.CreateGpuBuffer(
-    UInt64(FNumQHeads) * FMaxSeqLen * FMaxSeqLen * SizeOf(Single),
+    UInt64(FNumQHeads) * LPrefillCapacity * FMaxSeqLen * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 

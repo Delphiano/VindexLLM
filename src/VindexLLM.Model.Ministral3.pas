@@ -4,6 +4,7 @@ interface
 
 uses
   System.SysUtils, System.Generics.Collections,
+  VindexLLM.WeightPager,
   VindexLLM.Model, VindexLLM.GGUFReader, VindexLLM.Compute, VindexLLM.Vulkan;
 
 type
@@ -31,6 +32,7 @@ type
     FLayers: TArray<TVdxMinistralLayer>;
     FEmbedding, FOutput, FFinalNorm: TVdxMinistralTensor;
     FOwned: TList<TVdxGpuBuffer>;
+    FPager: TVdxWeightPager;
     FLayout: VkDescriptorSetLayout;
     FShader: VkShaderModule;
     FKernel: TVdxComputePipelineBundle;
@@ -229,6 +231,12 @@ begin
   N := VdxGGMLTensorBytes(Info.TensorType,AWidth,ARows);
   Data := FReader.GetTensorDataPtr(AName,N);
   if (N=0) or (Data=nil) then raise EConvertError.Create('Invalid tensor data: '+AName);
+  if (FPager <> nil) and not ANorm and AName.StartsWith('blk.') then
+  begin
+    Result.Buffer := FPager.Buffer(AName);
+    Result.Kind := Info.TensorType; Result.Width := AWidth; Result.Rows := ARows;
+    Exit;
+  end;
   Result.Buffer := NewBuffer(N);
   Result.Kind := Info.TensorType; Result.Width := AWidth; Result.Rows := ARows;
   Inc(FWeightBytes,Result.Buffer.Size);
@@ -241,7 +249,11 @@ begin
 end;
 
 function TVdxMinistral3Model.LoadWeights(): Boolean;
-var I: Integer; P: string; Info: TVdxGGUFTensorInfo;
+var I, J: Integer; P: string; Info: TVdxGGUFTensorInfo;
+const
+  Names: array[0..6] of string = ('attn_q.weight', 'attn_k.weight',
+    'attn_v.weight', 'attn_output.weight', 'ffn_gate.weight',
+    'ffn_up.weight', 'ffn_down.weight');
 begin
   // Refuse extra executable tensors rather than silently ignoring biases/adapters.
   for Info in FReader.GetTensorList() do
@@ -253,6 +265,21 @@ begin
   else FOutput := FEmbedding;
   FFinalNorm := ReadTensor('output_norm.weight',FHiddenDim,1,True);
   SetLength(FLayers,FNumLayers);
+  FPager := TVdxWeightPager.Create(FCompute, FReader);
+  for I := 0 to Integer(FNumLayers)-1 do
+  begin
+    P := Format('blk.%d.',[I]);
+    for J := 0 to High(Names) do FPager.Add(P+Names[J], I, J);
+    FLayers[I].AttnNorm := ReadTensor(P+'attn_norm.weight',FHiddenDim,1,True);
+    FLayers[I].FFNNorm := ReadTensor(P+'ffn_norm.weight',FHiddenDim,1,True);
+    FLayers[I].KCache := NewBuffer(CacheBytesPerLayer());
+    FLayers[I].VCache := NewBuffer(CacheBytesPerLayer());
+    Inc(FCacheBytes,2*CacheBytesPerLayer());
+  end;
+  FPager.Allocate(FNumLayers, (FCompute.GetVRAMSizeMB()*UInt64(1024*1024) div 4)*3);
+  Inc(FWeightBytes, FPager.WeightBytes());
+  Status('Weight paging: %d resident layers, %d streamed from mapped RAM',
+    [FPager.ResidentLayers, Integer(FNumLayers)-FPager.ResidentLayers]);
   for I := 0 to Integer(FNumLayers)-1 do
   begin
     Status('Uploading Ministral layer %d/%d',[I+1,FNumLayers]);
@@ -264,11 +291,6 @@ begin
     FLayers[I].Gate := ReadTensor(P+'ffn_gate.weight',FHiddenDim,FFFNWidth);
     FLayers[I].Up := ReadTensor(P+'ffn_up.weight',FHiddenDim,FFFNWidth);
     FLayers[I].Down := ReadTensor(P+'ffn_down.weight',FFFNWidth,FHiddenDim);
-    FLayers[I].AttnNorm := ReadTensor(P+'attn_norm.weight',FHiddenDim,1,True);
-    FLayers[I].FFNNorm := ReadTensor(P+'ffn_norm.weight',FHiddenDim,1,True);
-    FLayers[I].KCache := NewBuffer(CacheBytesPerLayer());
-    FLayers[I].VCache := NewBuffer(CacheBytesPerLayer());
-    Inc(FCacheBytes,2*CacheBytesPerLayer());
   end;
   FWeightType := FLayers[0].Q.Kind;
   Result := not FErrors.HasErrors();
@@ -309,6 +331,7 @@ end;
 procedure TVdxMinistral3Model.Layer(const ALayer: Integer; const N, Position: UInt32);
 var L: TVdxMinistralLayer; P: TVdxMinistralPush;
 begin
+  if FPager <> nil then FPager.PrepareLayer(ALayer);
   if (N=0) or (N>FBatchCount) or (UInt64(Position)+N>FMaxSeqLen) then
     raise ERangeError.Create('Ministral batch exceeds allocated context');
   L := FLayers[ALayer];
@@ -401,12 +424,14 @@ begin
 end;
 function TVdxMinistral3Model.AllocatedBytes(var AWeights, ACache, AScratch: UInt64): Boolean;
 begin
-  AWeights := FWeightBytes; ACache := FCacheBytes; AScratch := FScratchBytes; Result := True;
+  AWeights := FWeightBytes; ACache := FCacheBytes;
+  AScratch := FCompute.AllocatedBytes - AWeights - ACache; Result := True;
 end;
 
 procedure TVdxMinistral3Model.FreeWeights();
 var B: TVdxGpuBuffer; I: Integer;
 begin
+  FreeAndNil(FPager);
   if FOwned <> nil then
   begin
     for I := 0 to FOwned.Count-1 do

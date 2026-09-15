@@ -74,11 +74,19 @@ type
     // Accessors
     function GetLayerCount(): Integer;
     function GetLayer(const AIndex: Integer): TVdxFFNLayerView;
+    // Assign borrowed paging buffers; clear these before freeing their owner.
+    procedure SetLayerBuffers(const AIndex: Integer; const AGate, ADown: TVdxGpuBuffer);
     function GetHiddenDim(): UInt64;
     function GetFFNWidth(): UInt64;
   end;
 
 implementation
+
+procedure TVdxFFN.SetLayerBuffers(const AIndex: Integer; const AGate, ADown: TVdxGpuBuffer);
+begin
+  FLayers[AIndex].GateGpuBuffer := AGate;
+  FLayers[AIndex].DownGpuBuffer := ADown;
+end;
 
 { TVdxFFN }
 

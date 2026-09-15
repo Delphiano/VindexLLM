@@ -73,6 +73,7 @@ type
 
   { TVdxGpuBuffer }
   TVdxGpuBuffer = record
+    AllocationBytes: UInt64;
     Buffer: VkBuffer;
     Memory: VkDeviceMemory;
     Size:   VkDeviceSize;
@@ -106,6 +107,8 @@ type
 
     // Batch mode — records multiple dispatches into one command buffer submission
     FBatchMode: Boolean;
+    FSynchronousDispatch: Boolean;
+    FAllocatedBytes: UInt64;
     FBatchDeferredPools: array of VkDescriptorPool;
     FBatchDeferredPoolCount: Integer;
 
@@ -203,6 +206,8 @@ type
     //   >= 0         — explicit index from EnumerateGpus
     procedure Init(const AGpuIndex: Integer = -1);
     function IsReady(): Boolean;
+    property SynchronousDispatch: Boolean read FSynchronousDispatch write FSynchronousDispatch;
+    property AllocatedBytes: UInt64 read FAllocatedBytes;
 
     // Buffer operations
     function  CreateGpuBuffer(const ASize: VkDeviceSize; const AUsage: VkFlags; const AMemProps: VkFlags): TVdxGpuBuffer;
@@ -761,6 +766,8 @@ begin
 
   // Bind buffer to memory
   if not CheckVk(FvkBindBufferMemory(FDevice, Result.Buffer, Result.Memory, 0), 'vkBindBufferMemory') then Exit;
+  Result.AllocationBytes := LMemReqs.size;
+  Inc(FAllocatedBytes, Result.AllocationBytes);
   except
     DestroyGpuBuffer(Result);
     raise;
@@ -769,6 +776,7 @@ end;
 
 procedure TVdxCompute.DestroyGpuBuffer(var ABuffer: TVdxGpuBuffer);
 begin
+  Dec(FAllocatedBytes, ABuffer.AllocationBytes);
   if ABuffer.Buffer <> VK_NULL_HANDLE then
     FvkDestroyBuffer(FDevice, ABuffer.Buffer, nil);
 
@@ -1137,6 +1145,8 @@ begin
   FvkCmdBindDescriptorSets(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipelineLayout, 0, 1, @ADescSet, 0, nil);
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
 
+  if not FBatchMode then InsertBatchBarrier();
+
   if not FBatchMode then
   begin
     // Non-batch: end + submit + fence
@@ -1172,6 +1182,8 @@ begin
   FvkCmdBindDescriptorSets(FCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, APipelineLayout, 0, 1, @ADescSet, 0, nil);
   FvkCmdPushConstants(FCommandBuffer, APipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, APushSize, APushData);
   FvkCmdDispatch(FCommandBuffer, AGroupsX, AGroupsY, AGroupsZ);
+
+  if not FBatchMode then InsertBatchBarrier();
 
   if not FBatchMode then
   begin
@@ -1209,6 +1221,8 @@ begin
   LCopyRegion.dstOffset := 0;
   LCopyRegion.size := ASize;
   FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
+
+  if not FBatchMode then InsertBatchBarrier();
 
   if not FBatchMode then
   begin
@@ -1248,6 +1262,8 @@ begin
   LCopyRegion.dstOffset := ADstOffset;
   LCopyRegion.size := ASize;
   FvkCmdCopyBuffer(FCommandBuffer, ASrc.Buffer, ADst.Buffer, 1, LCopyRegion);
+
+  if not FBatchMode then InsertBatchBarrier();
 
   if not FBatchMode then
   begin
@@ -1295,6 +1311,7 @@ var
   LBeginInfo: VkCommandBufferBeginInfo;
 begin
   RequireReady();
+  if FSynchronousDispatch then Exit;
   if FBatchMode then
   begin
     FErrors.Add(esError, 'VULKAN_BATCH', 'BeginBatch called while already in batch mode');
@@ -1315,6 +1332,7 @@ var
   LSubmitInfo: VkSubmitInfo;
   LI: Integer;
 begin
+  if FSynchronousDispatch then Exit;
   if not IsReady() then
   begin
     FBatchMode := False;

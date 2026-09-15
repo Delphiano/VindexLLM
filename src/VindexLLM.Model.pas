@@ -397,7 +397,7 @@ begin
   if FErrors.HasFatal() then Exit;
 
   FAttn.Init(FCompute, FHiddenDim, FNumQHeads, FNumKVHeads,
-    FHeadDim, FNumLayers, FMaxSeqLen, FFFNWidth);
+    FHeadDim, FNumLayers, FMaxSeqLen, FFFNWidth, PrefillBatchSize());
   if FErrors.HasFatal() then Exit;
 
   // Tokenizer
@@ -919,7 +919,7 @@ begin
 
   // Token IDs buffer: host-visible, sized for max sequence length
   FTokenIdsGpu := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * SizeOf(UInt32),
+    UInt64(PrefillBatchSize()) * SizeOf(UInt32),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
@@ -935,39 +935,39 @@ begin
   Status('  Allocating prefill matrix buffers...');
 
   FResidualMat := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FHiddenDim * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FWorkMat := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FHiddenDim * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FQMat := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FNumQHeads * FHeadDim * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FNumQHeads * FHeadDim * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FKMat := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FNumKVHeads * FHeadDim * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FNumKVHeads * FHeadDim * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FVMat := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FNumKVHeads * FHeadDim * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FNumKVHeads * FHeadDim * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FAttnOutMatBuf := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FHiddenDim * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FGateMat := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FFFNWidth * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FFFNWidth * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FUpMatBuf := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FFFNWidth * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FFFNWidth * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   FFFNOutMat := FCompute.CreateGpuBuffer(
-    UInt64(FMaxSeqLen) * FHiddenDim * SizeOf(Single),
+    UInt64(PrefillBatchSize()) * FHiddenDim * SizeOf(Single),
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 

@@ -17,18 +17,24 @@ interface
 
 uses
   VindexLLM.GGUFReader,
+  VindexLLM.WeightPager,
   VindexLLM.Model;
 
 type
 
   { TVdxGemma3Model }
   TVdxGemma3Model = class(TVdxModel)
+  private
+    FPager: TVdxWeightPager;
   public
     class function SupportedArchitectures(): TArray<string>; override;
 
     function LoadModelConfig(const AReader: TVdxGGUFReader;
       const AMaxContext: Integer): Boolean; override;
     function LoadWeights(): Boolean; override;
+    procedure FreeWeights(); override;
+    function PrefillBatchSize(): Integer; override;
+    function AllocatedBytes(var AWeights, ACache, AScratch: UInt64): Boolean; override;
 
     procedure RunLayerForward(const ALayer: Integer;
       const APosition: Integer); override;
@@ -124,7 +130,13 @@ end;
 
 function TVdxGemma3Model.LoadWeights(): Boolean;
 var
-  LLayer: Integer;
+  LLayer, LSlot: Integer;
+  LPrefix: string;
+  LBudget: UInt64;
+const
+  Names: array[0..6] of string = ('attn_q.weight', 'attn_k.weight',
+    'attn_v.weight', 'attn_output.weight', 'ffn_gate.weight',
+    'ffn_up.weight', 'ffn_down.weight');
 begin
   Result := False;
   Status('Uploading weights to GPU...');
@@ -135,21 +147,12 @@ begin
     FErrors.Add(esFatal, 'LOAD', 'Failed to build FFN weight index from GGUF');
     Exit;
   end;
-  Status('  Uploading gate/down vectors (%d layers)...', [FNumLayers]);
-  FFFN.UploadAll(FCompute);
-
-  // Per-layer attention weights (Q/K/V/O)
-  Status('  Uploading attention weights (%d layers)...', [FNumLayers]);
+  FPager := TVdxWeightPager.Create(FCompute, FReader);
+  for LLayer := 0 to Integer(FNumLayers) - 1 do
+    for LSlot := 0 to High(Names) do
+      FPager.Add(Format('blk.%d.%s', [LLayer, Names[LSlot]]), LLayer, LSlot);
   SetLength(FAttnWeights, FNumLayers);
-  for LLayer := 0 to Integer(FNumLayers) - 1 do
-    FAttn.UploadAttnWeights(FReader, LLayer, FAttnWeights[LLayer]);
-
-  // Per-layer FFN up weights
-  Status('  Uploading FFN up weights (%d layers)...', [FNumLayers]);
   SetLength(FUpWeights, FNumLayers);
-  for LLayer := 0 to Integer(FNumLayers) - 1 do
-    FUpWeights[LLayer] := UploadWeightTensor(
-      Format('blk.%d.ffn_up.weight', [LLayer]));
 
   // Per-layer norm weights (6 per layer)
   Status('  Uploading norm weights (%d layers)...', [FNumLayers]);
@@ -201,8 +204,64 @@ begin
   // Build batch resources (needs FEmbedGpu valid + FVocabSize set)
   if not BuildBatchResources() then Exit;
 
+  // Leave 25% of the heap for the driver, allocation alignment and other apps.
+  // All permanent scratch/cache/embedding allocations already exist here.
+  LBudget := (FCompute.GetVRAMSizeMB() * UInt64(1024 * 1024) div 4) * 3;
+  FPager.Allocate(FNumLayers, LBudget);
+  for LLayer := 0 to Integer(FNumLayers) - 1 do
+  begin
+    LPrefix := Format('blk.%d.', [LLayer]);
+    FAttnWeights[LLayer].WeightType := FWeightType;
+    FAttnWeights[LLayer].QWeightGpu := FPager.Buffer(LPrefix + Names[0]);
+    FAttnWeights[LLayer].KWeightGpu := FPager.Buffer(LPrefix + Names[1]);
+    FAttnWeights[LLayer].VWeightGpu := FPager.Buffer(LPrefix + Names[2]);
+    FAttnWeights[LLayer].OWeightGpu := FPager.Buffer(LPrefix + Names[3]);
+    FFFN.SetLayerBuffers(LLayer, FPager.Buffer(LPrefix + Names[4]),
+      FPager.Buffer(LPrefix + Names[6]));
+    FUpWeights[LLayer] := FPager.Buffer(LPrefix + Names[5]);
+  end;
+  Status('Weight paging: %d resident layers, %d streamed from mapped RAM; GPU buffers=%d MiB',
+    [FPager.ResidentLayers, Integer(FNumLayers) - FPager.ResidentLayers,
+     FCompute.AllocatedBytes div (1024 * 1024)]);
+
   Status('Weights loaded. Embed scale: %.4f', [FEmbedScale]);
   Result := True;
+end;
+
+procedure TVdxGemma3Model.FreeWeights();
+var I: Integer; Empty: TVdxGpuBuffer;
+begin
+  if FPager <> nil then
+  begin
+    // These handles belong to the pager (including resident weights).
+    FAttnWeights := nil;
+    FUpWeights := nil;
+    Empty := Default(TVdxGpuBuffer);
+    for I := 0 to FFFN.GetLayerCount() - 1 do FFFN.SetLayerBuffers(I, Empty, Empty);
+    FreeAndNil(FPager);
+  end;
+  inherited;
+end;
+
+function TVdxGemma3Model.PrefillBatchSize(): Integer;
+begin
+  if FArchitecture = 'gemma-embedding' then Result := inherited PrefillBatchSize()
+  else Result := Min(Integer(FMaxSeqLen), 32);
+end;
+
+function TVdxGemma3Model.AllocatedBytes(var AWeights, ACache, AScratch: UInt64): Boolean;
+var I: Integer;
+begin
+  Result := FPager <> nil;
+  if not Result then Exit;
+  AWeights := FPager.WeightBytes() + FEmbedGpu.AllocationBytes + FOutputNormGpu.AllocationBytes;
+  for I := 0 to High(FNormWeights) do
+    Inc(AWeights, FNormWeights[I].AttnNormGpu.AllocationBytes +
+      FNormWeights[I].PostAttnNormGpu.AllocationBytes + FNormWeights[I].FFNNormGpu.AllocationBytes +
+      FNormWeights[I].PostFFNNormGpu.AllocationBytes + FNormWeights[I].QNormGpu.AllocationBytes +
+      FNormWeights[I].KNormGpu.AllocationBytes);
+  ACache := UInt64(2) * FNumLayers * CacheBytesPerLayer();
+  AScratch := FCompute.AllocatedBytes - AWeights - ACache;
 end;
 
 procedure TVdxGemma3Model.RunLayerForward(const ALayer: Integer;
@@ -212,6 +271,7 @@ var
   LGeluPush: TVdxGeluMulPush;
   LFusedPush: TVdxFusedGateUpPush;
 begin
+  if FPager <> nil then FPager.PrepareLayer(ALayer);
   // === Attention branch: x = x + PostAttnNorm(Attn(PreAttnNorm(x))) ===
 
   // Fused copy+norm: residual → PreAttnNorm → WorkBufA
@@ -295,6 +355,7 @@ var
   LGeluPush: TVdxGeluMulPush;
   LFusedBatchPush: TVdxFusedGateUpBatchPush;
 begin
+  if FPager <> nil then FPager.PrepareLayer(ALayer);
   // === Attention branch ===
 
   // Fused copy+norm batch: FResidualMat → PreAttnNorm → FWorkMat
