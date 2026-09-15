@@ -16,8 +16,10 @@ são síncronos nesse modo, com fences e barreiras Vulkan, para que nenhum peso 
 descriptor seja reutilizado enquanto a GPU ainda o lê. Todos os cálculos continuam
 nos shaders existentes; não há execução de camadas na CPU.
 
-O Gemma de texto usa prefill de até 32 tokens por bloco. O cache mantém o contexto
-configurado. Gemma Embedding preserva o prefill completo para atenção bidirecional.
+O Gemma de texto com contexto explícito usa prefill de até 32 tokens por bloco.
+O cache mantém o contexto configurado. Gemma Embedding e o carregamento pelo
+módulo Embeddings (contexto nativo, `AMaxContext=0`) preservam o prefill completo
+para atenção bidirecional.
 
 ## Ajuste opcional
 
@@ -38,3 +40,4 @@ livre do driver. Falhas Vulkan continuam interrompendo o carregamento com diagn�
 - O GGUF deve permanecer disponível e inalterado enquanto o modelo estiver aberto.
 - Os handles retornados pelo pager são emprestados; somente o pager os destrói.
 - Não foram executados testes de inferência ou desempenho para esta implementação.
+- O projeto VdxTestbed foi compilado em Win64; o executável não foi iniciado.

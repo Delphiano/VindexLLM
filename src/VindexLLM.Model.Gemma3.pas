@@ -245,7 +245,9 @@ end;
 
 function TVdxGemma3Model.PrefillBatchSize(): Integer;
 begin
-  if FArchitecture = 'gemma-embedding' then Result := inherited PrefillBatchSize()
+  // Embeddings.LoadModel requests the full native context (AMaxContext=0)
+  // and runs bidirectional attention over the complete input.
+  if (FArchitecture = 'gemma-embedding') or (FMaxContext <= 0) then Result := inherited PrefillBatchSize()
   else Result := Min(Integer(FMaxSeqLen), 32);
 end;
 
