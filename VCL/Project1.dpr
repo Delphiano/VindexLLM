@@ -1,4 +1,4 @@
-program Project1;
+﻿program Project1;
 
 uses
   Vcl.Forms,
@@ -7,7 +7,8 @@ uses
   VindexLLM.Tokenizer in '..\src\VindexLLM.Tokenizer.pas',
   VindexLLM.Inference in '..\src\VindexLLM.Inference.pas',
   VindexLLM.Model.Llama in '..\src\VindexLLM.Model.Llama.pas',
-  VindexLLM.Model.Mistral3 in '..\src\VindexLLM.Model.Mistral3.pas';
+  VindexLLM.Model.Ministral3 in '..\src\VindexLLM.Model.Ministral3.pas',
+  VindexLLM.Model.Qwen35 in '..\src\VindexLLM.Model.Qwen35.pas';
 
 {$R *.res}
 

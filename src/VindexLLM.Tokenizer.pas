@@ -44,6 +44,8 @@ type
     FBosId: Integer;
     FEosId: Integer;
     FByteBPE: Boolean;
+    FBytePre: string;
+    FAddBos: Boolean;
     FByteChars: array[0..255] of Char;
     FCharBytes: TDictionary<Char, Byte>;
     FMergeRanks: TDictionary<string, Integer>;
@@ -86,7 +88,7 @@ type
 implementation
 
 uses
-  System.Math, System.RegularExpressions;
+  System.Math, System.RegularExpressions, Winapi.Windows;
 
 { TVdxTokenizer }
 constructor TVdxTokenizer.Create();
@@ -135,13 +137,17 @@ begin
   end;
 
   FByteBPE := SameText(AReader.GetMetadataString('tokenizer.ggml.model'), 'gpt2');
+  FBytePre := LowerCase(AReader.GetMetadataString('tokenizer.ggml.pre'));
+  FAddBos := (FBytePre <> 'qwen35') and (FBytePre <> 'qwen2');
+  if AReader.GetMetadata('tokenizer.ggml.add_bos_token', LMerges) then
+    FAddBos := LMerges.AsBool;
   FMergeRanks.Clear();
   if FByteBPE then
   begin
-    if not SameText(AReader.GetMetadataString('tokenizer.ggml.pre'), 'tekken') then
-      raise ENotSupportedException.Create('Only Tekken byte-BPE is implemented');
+    if (FBytePre <> 'tekken') and (FBytePre <> 'qwen2') and (FBytePre <> 'qwen35') then
+      raise ENotSupportedException.Create('Unsupported byte-BPE pre-tokenizer: '+FBytePre);
     if not AReader.GetMetadata('tokenizer.ggml.merges', LMerges) then
-      raise EConvertError.Create('Tekken vocabulary requires merge ranks');
+      raise EConvertError.Create('Byte-BPE vocabulary requires merge ranks');
     for LI := 0 to High(LMerges.ArrayItems) do
       if not FMergeRanks.ContainsKey(LMerges.ArrayItems[LI].AsString) then
         FMergeRanks.Add(LMerges.ArrayItems[LI].AsString, LI);
@@ -283,7 +289,7 @@ var
 begin
   LResult := TList<Integer>.Create();
   try
-    if AAddBos then
+    if AAddBos and FAddBos and (FBosId >= 0) then
       LResult.Add(FBosId);
 
     LPos := 1;  // Delphi strings are 1-based
@@ -446,10 +452,12 @@ procedure TVdxTokenizer.EncodeByteSegment(const AText: string;
   const AResult: TList<Integer>);
 const
   // Exact Unicode-aware Tekken pre-tokenizer (mistral-common/tokenizer.json).
-  Pattern = '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+' +
+  TekkenPattern = '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+' +
     '|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*' +
     '|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+';
 var
+  Pattern, Text: string;
+  Required, Written: Integer;
   M: TMatch;
   Pieces: TList<string>;
   Bytes: TBytes;
@@ -457,16 +465,31 @@ var
   I, Rank, Best, BestRank, Id, Consumed: Integer;
   Key: string;
 begin
-  Consumed := 0;
-  for M in TRegEx.Matches(AText, Pattern) do
+  Text := AText;
+  if (FBytePre = 'qwen35') and (Text <> '') then
   begin
-    if M.Index <> Consumed + 1 then raise EConvertError.Create('Tekken pre-tokenizer skipped input');
+    Required := NormalizeString(NormalizationC,PChar(AText),Length(AText),nil,0);
+    if Required <= 0 then RaiseLastOSError;
+    SetLength(Text,Required);
+    Written := NormalizeString(NormalizationC,PChar(AText),Length(AText),PChar(Text),Required);
+    if Written <= 0 then RaiseLastOSError;
+    SetLength(Text,Written);
+  end;
+  Pattern := TekkenPattern;
+  if FBytePre = 'qwen2' then
+    Pattern := '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  if FBytePre = 'qwen35' then
+    Pattern := '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  Consumed := 0;
+  for M in TRegEx.Matches(Text, Pattern) do
+  begin
+    if M.Index <> Consumed + 1 then raise EConvertError.Create('Byte-BPE pre-tokenizer skipped input');
     Inc(Consumed, M.Length);
     Bytes := TEncoding.UTF8.GetBytes(M.Value);
     // Tekken's ignore_merges flag: an entire pre-token present in the vocab wins.
     SetLength(Key, Length(Bytes));
     for I := 0 to High(Bytes) do Key[I+1] := FByteChars[Bytes[I]];
-    if FTokenToId.TryGetValue(Key, Id) then
+    if (FBytePre = 'tekken') and FTokenToId.TryGetValue(Key, Id) then
     begin
       AResult.Add(Id);
       Continue;
@@ -493,14 +516,14 @@ begin
       for I := 0 to Pieces.Count - 1 do
       begin
         if not FTokenToId.TryGetValue(Pieces[I], Id) then
-          raise EConvertError.Create('Tekken piece missing from GGUF vocabulary');
+          raise EConvertError.Create('Byte-BPE piece missing from GGUF vocabulary');
         AResult.Add(Id);
       end;
     finally
       Pieces.Free();
     end;
   end;
-  if Consumed <> Length(AText) then raise EConvertError.Create('Tekken pre-tokenizer left unparsed input');
+  if Consumed <> Length(Text) then raise EConvertError.Create('Byte-BPE pre-tokenizer left unparsed input');
 end;
 
 function TVdxTokenizer.TokenBytes(const AId: Integer): TBytes;

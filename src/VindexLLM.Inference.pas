@@ -201,6 +201,8 @@ implementation
 
 uses
   VindexLLM.Model.Ministral3,
+  VindexLLM.Model.Qwen35,
+  VindexLLM.Model.Llama,
   VindexLLM.GGUFReader,
   VindexLLM.Attention,
   VindexLLM.Tokenizer;
@@ -761,7 +763,7 @@ type
     HeadDim: UInt32;
     MaxSeqLen: UInt32;
     CurrentPosition: UInt32;
-    Reserved: UInt32;
+    Reserved: UInt32; // cache format: 0=TQ3, 1=F32, 2=Qwen35 hybrid
     ModelFingerprint: array[0..31] of Byte;
   end;
 
@@ -907,14 +909,6 @@ begin
         FErrors.Add(esError, 'LOAD',
           'Unsupported version %d (this build reads version %d)',
           [LHeader.Version, CVdxKVCacheVersion]);
-        Exit;
-      end;
-
-      if LHeader.Reserved <> 0 then
-      begin
-        FErrors.Add(esError, 'LOAD',
-          'Corrupt header: reserved field is nonzero (%d)',
-          [LHeader.Reserved]);
         Exit;
       end;
 

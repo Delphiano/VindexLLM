@@ -109,6 +109,9 @@ type
     FBatchMode: Boolean;
     FSynchronousDispatch: Boolean;
     FAllocatedBytes: UInt64;
+    // Valid storage buffer used for descriptor slots that are rebound later.
+    // Vulkan still requires a real buffer at descriptor-set allocation time.
+    FDescriptorDummy: TVdxGpuBuffer;
     FBatchDeferredPools: array of VkDescriptorPool;
     FBatchDeferredPoolCount: Integer;
 
@@ -193,6 +196,7 @@ type
     procedure RequireReady();
     procedure ValidateBuffer(const ABuffer: TVdxGpuBuffer;
       const AOffset, ASize: VkDeviceSize; const AOperation: string);
+    procedure EnsureDescriptorDummy();
 
   public
     constructor Create(); override;
@@ -280,6 +284,7 @@ begin
   FBatchMode := False;
   FBatchDeferredPoolCount := 0;
   FSelectedGpuIndex := -1;
+  FDescriptorDummy := Default(TVdxGpuBuffer);
 end;
 
 procedure TVdxCompute.Init(const AGpuIndex: Integer);
@@ -337,6 +342,9 @@ begin
 
     if (FFence <> VK_NULL_HANDLE) and Assigned(FvkDestroyFence) then
       FvkDestroyFence(FDevice, FFence, nil);
+
+    if FDescriptorDummy.Buffer <> VK_NULL_HANDLE then
+      DestroyGpuBuffer(FDescriptorDummy);
 
     if (FCommandPool <> VK_NULL_HANDLE) and Assigned(FvkDestroyCommandPool) then
       FvkDestroyCommandPool(FDevice, FCommandPool, nil);
@@ -502,6 +510,14 @@ begin
   if (AOffset > ABuffer.Size) or (ASize > ABuffer.Size - AOffset) then
     Fail(Format('%s: range exceeds buffer (offset=%d, bytes=%d, size=%d)',
       [AOperation, AOffset, ASize, ABuffer.Size]));
+end;
+
+procedure TVdxCompute.EnsureDescriptorDummy();
+begin
+  if FDescriptorDummy.Buffer = VK_NULL_HANDLE then
+    FDescriptorDummy := CreateGpuBuffer(4,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 end;
 
 procedure TVdxCompute.CreateVkInstance();
@@ -1057,12 +1073,23 @@ var
   LAllocInfo: VkDescriptorSetAllocateInfo;
   LBufferInfos: array of VkDescriptorBufferInfo;
   LWrites: array of VkWriteDescriptorSet;
+  LBuffers: array of TVdxGpuBuffer;
   LI: Integer;
 begin
   RequireReady();
   Result := VK_NULL_HANDLE;
+  SetLength(LBuffers, Length(ABuffers));
   for LI := 0 to High(ABuffers) do
-    ValidateBuffer(ABuffers[LI], 0, ABuffers[LI].Size, 'AllocateDescriptorSetForBuffers');
+  begin
+    LBuffers[LI] := ABuffers[LI];
+    if (LBuffers[LI].Buffer = VK_NULL_HANDLE) or
+       (LBuffers[LI].Memory = VK_NULL_HANDLE) then
+    begin
+      EnsureDescriptorDummy();
+      LBuffers[LI] := FDescriptorDummy;
+    end;
+    ValidateBuffer(LBuffers[LI], 0, LBuffers[LI].Size, 'AllocateDescriptorSetForBuffers');
+  end;
   // Allocate the set
   FillChar(LAllocInfo, SizeOf(LAllocInfo), 0);
   LAllocInfo.sType := VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1072,12 +1099,12 @@ begin
   if not CheckVk(FvkAllocateDescriptorSets(FDevice, LAllocInfo, @Result), 'vkAllocateDescriptorSets') then Exit;
 
   // Bind buffers to descriptor set
-  SetLength(LBufferInfos, Length(ABuffers));
-  SetLength(LWrites, Length(ABuffers));
+  SetLength(LBufferInfos, Length(LBuffers));
+  SetLength(LWrites, Length(LBuffers));
 
-  for LI := 0 to High(ABuffers) do
+  for LI := 0 to High(LBuffers) do
   begin
-    LBufferInfos[LI].buffer := ABuffers[LI].Buffer;
+    LBufferInfos[LI].buffer := LBuffers[LI].Buffer;
     LBufferInfos[LI].offset := 0;
     LBufferInfos[LI].range := VK_WHOLE_SIZE;
 

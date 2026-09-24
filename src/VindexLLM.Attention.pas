@@ -1142,25 +1142,25 @@ begin
   end;
   FCompute.BatchBarrier(); // Q/K/V matrices ready
 
-  // ---- Step 2: QK-norm (reuse existing shader with NumHeads * NumTokens) ----
-  // QMat is [N x NumQHeads x HeadDim] flat = [N*NumQHeads x HeadDim]
-  LQKNormPush.HeadDim := FHeadDim;
-  LQKNormPush.Eps := 1e-6;
-
-  LQKNormPush.NumHeads := FNumQHeads * ANumTokens;
-  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [AQMat, AQNormBuf]);
-  FCompute.DispatchComputeWithPush(
-    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
-    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush),
-    FNumQHeads * ANumTokens);
-
-  LQKNormPush.NumHeads := FNumKVHeads * ANumTokens;
-  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [AKMat, AKNormBuf]);
-  FCompute.DispatchComputeWithPush(
-    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
-    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush),
-    FNumKVHeads * ANumTokens);
-  FCompute.BatchBarrier(); // Q/K normed
+  // ---- Step 2: optional QK-norm (LLaMA skips this pass) ----
+  if (AQNormBuf.Buffer <> VK_NULL_HANDLE) and (AKNormBuf.Buffer <> VK_NULL_HANDLE) then
+  begin
+    LQKNormPush.HeadDim := FHeadDim;
+    LQKNormPush.Eps := 1e-6;
+    LQKNormPush.NumHeads := FNumQHeads * ANumTokens;
+    FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [AQMat, AQNormBuf]);
+    FCompute.DispatchComputeWithPush(
+      FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+      FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush),
+      FNumQHeads * ANumTokens);
+    LQKNormPush.NumHeads := FNumKVHeads * ANumTokens;
+    FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [AKMat, AKNormBuf]);
+    FCompute.DispatchComputeWithPush(
+      FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+      FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush),
+      FNumKVHeads * ANumTokens);
+    FCompute.BatchBarrier();
+  end;
 
   // ---- Step 3: Batched RoPE (per-token positions start_pos..start_pos+N-1) ----
   LRoPEPush.HeadDim := FHeadDim;
@@ -1478,24 +1478,23 @@ begin
   end;
   FCompute.BatchBarrier(); // Q/K/VBuf ready for QK-norm
 
-  // ---- Step 2: QK-norm on Q (8 heads) and K (4 heads) ----
-  LQKNormPush.HeadDim := FHeadDim;
-  LQKNormPush.Eps := 1e-6;
-
-  // QK-norm on Q
-  LQKNormPush.NumHeads := FNumQHeads;
-  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [FQBuf, AQNormBuf]);
-  FCompute.DispatchComputeWithPush(
-    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
-    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumQHeads);
-
-  // QK-norm on K (independent of Q — writes different buffer)
-  LQKNormPush.NumHeads := FNumKVHeads;
-  FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [FKBuf, AKNormBuf]);
-  FCompute.DispatchComputeWithPush(
-    FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
-    FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumKVHeads);
-  FCompute.BatchBarrier(); // Q/KBuf normed, ready for RoPE
+  // ---- Step 2: optional QK-norm ----
+  if (AQNormBuf.Buffer <> VK_NULL_HANDLE) and (AKNormBuf.Buffer <> VK_NULL_HANDLE) then
+  begin
+    LQKNormPush.HeadDim := FHeadDim;
+    LQKNormPush.Eps := 1e-6;
+    LQKNormPush.NumHeads := FNumQHeads;
+    FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [FQBuf, AQNormBuf]);
+    FCompute.DispatchComputeWithPush(
+      FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+      FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumQHeads);
+    LQKNormPush.NumHeads := FNumKVHeads;
+    FCompute.UpdateDescriptorSetBuffers(FQKNormDescSet, [FKBuf, AKNormBuf]);
+    FCompute.DispatchComputeWithPush(
+      FQKNormBundle.Pipeline, FQKNormBundle.PipelineLayout,
+      FQKNormDescSet, @LQKNormPush, SizeOf(LQKNormPush), FNumKVHeads);
+    FCompute.BatchBarrier();
+  end;
   // ---- Step 3: RoPE on Q and K ----
   LRoPEPush.HeadDim := FHeadDim;
   LRoPEPush.Position := UInt32(APosition);

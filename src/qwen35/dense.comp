@@ -1,0 +1,175 @@
+﻿#version 450
+// Native Qwen3.5 text kernels. GGUF block layouts and YaRN conventions follow
+// ggml/llama.cpp (MIT); see README.md for the reference revision.
+layout(local_size_x=256) in;
+layout(std430,binding=0) readonly buffer ABuf { uint a[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint b[]; };
+layout(std430,binding=2) readonly buffer CBuf { uint c[]; };
+layout(std430,binding=3) buffer DBuf { uint d[]; };
+layout(std430,binding=4) buffer EBuf { float state[]; };
+layout(push_constant) uniform Params {
+ uint op; uint inDim; uint outDim; uint typ;
+ uint tokens; uint startPos; uint maxSeq; uint heads;
+ uint kvHeads; uint headDim;
+ float eps; float theta; float freqScale; float corrLow; float corrHigh;
+ float magnitude; float tempScale; uint origContext;
+} p;
+shared float tmp[256];
+uint byteA(uint off) { return (a[off/4] >> ((off%4)*8)) & 255; }
+float halfA(uint off) { return unpackHalf2x16(byteA(off) | (byteA(off+1)<<8)).x; }
+float weight(uint row,uint col) {
+ uint e=row*p.inDim+col;
+ if(p.typ==0) return uintBitsToFloat(a[e]);
+ if(p.typ==1) return halfA(e*2);
+ if(p.typ==2 || p.typ==3) {
+  uint stride=p.typ==2?18:20, off=(e/32)*stride, i=e%32;
+  uint q=(byteA(off+(p.typ==2?2:4)+(i%16)) >> (i>=16?4:0))&15;
+  return p.typ==2 ? halfA(off)*(float(q)-8.0) : halfA(off)*float(q)+halfA(off+2);
+ }
+ if(p.typ==8) {
+  uint off=(e/32)*34, q=byteA(off+2+e%32);
+  return halfA(off)*float(int(q>=128?q-256:q));
+ }
+ // Q3_K: 256 values / 110 bytes.  Each 16-value sub-block has a
+ // signed 6-bit scale; values are 2 low bits plus a separately packed bit.
+ if(p.typ==11) {
+  uint off=(e/256)*110, i=e%256, sub=i/16;
+  uint lo=sub<8 ? (byteA(off+96+sub)&15) : ((byteA(off+96+sub-8)>>4)&15);
+  uint hi=(byteA(off+104+(sub%4))>>(2*(sub/4)))&3;
+  int scale=int(lo|(hi<<4))-32;
+  uint segment=i/128, pair=(i%128)/32, lane=i%16, side=(i%32)/16;
+  uint q=(byteA(off+32+segment*32+side*16+lane)>>(2*pair))&3;
+  bool high=(byteA(off+side*16+lane)&(uint(1)<<(segment*4+pair)))!=0;
+  return halfA(off+108)*float(scale)*float(int(q)-(high?0:4));
+ }
+ if(p.typ==12) { // Q4_K: d, dmin, packed 6-bit scales/minima, nibbles
+  uint off=(e/256)*144, i=e%256, j=i/32;
+  uint sc, mn;
+  if(j<4) {sc=byteA(off+4+j)&63; mn=byteA(off+8+j)&63;}
+  else {sc=(byteA(off+8+j)&15)|((byteA(off+j)>>6)<<4);
+        mn=(byteA(off+8+j)>>4)|((byteA(off+4+j)>>6)<<4);}
+  uint q=(byteA(off+16+(i/64)*32+i%32) >> ((j%2)*4))&15;
+  return halfA(off)*float(sc*q)-halfA(off+2)*float(mn);
+ }
+ // Q6_K: 256 values / 210 bytes. Scale bytes are signed int8.
+ uint off=(e/256)*210, j=e%32, h=(e%256)/128, quadrant=(e%128)/32;
+ uint lo=(byteA(off+h*64+j+(quadrant%2)*32) >> (quadrant>=2?4:0))&15;
+ uint hi=(byteA(off+128+h*32+j) >> (quadrant*2))&3;
+ uint sc=byteA(off+192+h*8+j/16+quadrant*2);
+ return halfA(off+208)*float(int(sc>=128?sc-256:sc))*float(int(lo|(hi<<4))-32);
+}
+float A(uint i) { return uintBitsToFloat(a[i]); }
+float B(uint i) { return uintBitsToFloat(b[i]); }
+void put(uint i,float v) { d[i]=floatBitsToUint(v); }
+void sumReduce(uint t,float v) {
+ tmp[t]=v; barrier();
+ for(uint s=128;s>0;s/=2) { if(t<s) tmp[t]+=tmp[t+s]; barrier(); }
+}
+void main() {
+ uint t=gl_LocalInvocationID.x, x=gl_WorkGroupID.x, tok=gl_WorkGroupID.y;
+ if(p.op==0) { // embedding: token IDs in B, raw weight table A
+  for(uint i=t;i<p.inDim;i+=256) put(x*p.inDim+i,weight(b[x],i));
+ } else if(p.op==1) { // RMSNorm: A activations, B norm weights
+  float s=0; for(uint i=t;i<p.inDim;i+=256) {float v=A(x*p.inDim+i);s+=v*v;}
+  sumReduce(t,s); float inv=inversesqrt(tmp[0]/float(p.inDim)+p.eps);
+  for(uint i=t;i<p.inDim;i+=256) put(x*p.inDim+i,A(x*p.inDim+i)*inv*B(i));
+ } else if(p.op==2) { // matrix x batch of vectors
+  uint row=x+gl_WorkGroupID.z*65535;
+  if(row>=p.outDim) return;
+  float s=0; for(uint i=t;i<p.inDim;i+=256) s+=weight(row,i)*B(tok*p.inDim+i);
+  sumReduce(t,s); if(t==0) put(tok*p.outDim+row,tmp[0]);
+ } else if(p.op==3) { // GGUF normal RoPE: adjacent pairs (weights already permuted)
+  uint pos=p.startPos+tok;
+  for(uint i=t;i<p.headDim/2;i+=256) {
+   // Frequencies are prepared once in double precision as hi/lo F32 pairs.
+   // Compensated argument reduction avoids loss of phase on long contexts.
+   float hi=B(2*i), lo=B(2*i+1), position=float(pos);
+   float angleHi=position*hi;
+   float angleLo=fma(position,hi,-angleHi)+position*lo;
+   float turns=round(angleHi/6.283185307179586);
+   float angle=fma(-turns,6.283185482025146,angleHi)+(angleLo+turns*1.7484555314695172e-7);
+   float scale=p.magnitude;
+   if(p.typ==1) scale*=1.0+p.tempScale*log(1.0+floor(float(pos)/float(p.origContext)));
+   uint idx=(tok*p.heads+x)*p.headDim+2*i;
+   float av=A(idx), bv=A(idx+1), cs=cos(angle)*scale, sn=sin(angle)*scale;
+   put(idx,av*cs-bv*sn);put(idx+1,av*sn+bv*cs);
+  }
+ } else if(p.op==4) { // append KV: token-major cache
+  uint n=p.kvHeads*p.headDim;
+  for(uint i=t;i<n;i+=256) put((p.startPos+x)*n+i,A(x*n+i));
+ } else if(p.op==5) { // QK scores; one workgroup per key/query/head
+  uint head=gl_WorkGroupID.z, key=x, pos=p.startPos+tok;
+  uint outidx=(tok*p.heads+head)*p.maxSeq+key;
+  if(key>pos) {if(t==0) put(outidx,-3.402823e38);return;}
+  uint kh=head/(p.heads/p.kvHeads);
+  float s=0;for(uint i=t;i<p.headDim;i+=256) s+=A((tok*p.heads+head)*p.headDim+i)*B((key*p.kvHeads+kh)*p.headDim+i);
+  sumReduce(t,s);if(t==0) put(outidx,tmp[0]*inversesqrt(float(p.headDim)));
+ } else if(p.op==6) { // stable softmax, A and D may alias
+  uint n=p.startPos+tok+1, off=(tok*p.heads+x)*p.maxSeq;
+  float mx=-3.402823e38;
+  for(uint i=t;i<n;i+=256) mx=max(mx,A(off+i));
+  tmp[t]=mx;barrier();
+  for(uint s=128;s>0;s/=2){if(t<s)tmp[t]=max(tmp[t],tmp[t+s]);barrier();}
+  mx=tmp[0];barrier();
+  float sm=0;for(uint i=t;i<n;i+=256)sm+=exp(A(off+i)-mx);
+  sumReduce(t,sm);float den=tmp[0];
+  for(uint i=t;i<n;i+=256)put(off+i,exp(A(off+i)-mx)/den);
+ } else if(p.op==7) { // softmax(scores) times V
+  uint n=p.startPos+tok+1, kh=x/(p.heads/p.kvHeads);
+  for(uint i=t;i<p.headDim;i+=256){
+   float s=0;for(uint k=0;k<n;k++)s+=A((tok*p.heads+x)*p.maxSeq+k)*B((k*p.kvHeads+kh)*p.headDim+i);
+   put((tok*p.heads+x)*p.headDim+i,s);
+  }
+ } else if(p.op==8 || p.op==9) { // SwiGLU / residual add
+  uint i=x*256+t;if(i>=p.inDim*p.tokens)return;
+  float av=A(i),bv=B(i);
+  put(i,p.op==8?(av/(1.0+exp(-av)))*bv:av+bv);
+  } else if(p.op==10) { // causal depthwise conv + SiLU; E has 3 past inputs/channel
+  uint i=x*256+t; if(i>=p.inDim) return;
+  uint off=i*3;
+  float v0=p.startPos==0?0.0:state[off], v1=p.startPos==0?0.0:state[off+1];
+  float v2=p.startPos==0?0.0:state[off+2], v3=A(i);
+  float v=v0*B(i*4)+v1*B(i*4+1)+v2*B(i*4+2)+v3*B(i*4+3);
+  put(i,v/(1.0+exp(-v))); state[off]=v1;state[off+1]=v2;state[off+2]=v3;
+ } else if(p.op==11) { // L2 norm of Q and K, 128-wide heads (no division by width)
+  float v=t<p.inDim?A(x*p.inDim+t):0.0;
+  sumReduce(t,v*v); float inv=inversesqrt(tmp[0]+p.eps);
+  if(t<p.inDim) put(x*p.inDim+t,v*inv);
+ } else if(p.op==12) { // exp(-exp(A_log) * softplus(alpha + dt_bias)); GGUF stores -exp(A_log)
+  if(t>=p.inDim) return;
+  float v=A(t)+B(t), soft=max(v,0.0)+log(1.0+exp(-abs(v)));
+  put(t,exp(uintBitsToFloat(c[t])*soft));
+ } else if(p.op==13) { // recurrent gated delta rule: workgroup per value lane and head
+  uint h=tok, v=x, dim=p.inDim, n=p.heads*dim, idx=(h*dim+v)*dim+t;
+  float k=t<dim?A(n+h*dim+t):0.0;
+  float old=t<dim?(p.startPos==0?0.0:state[idx])*B(h):0.0;
+  sumReduce(t,old*k);
+  float delta=(A(2*n+h*dim+v)-tmp[0])/(1.0+exp(-uintBitsToFloat(c[h])));
+  // Every thread must consume tmp[0] before the next reduction overwrites it.
+  barrier();
+  float updated=old+k*delta;
+  if(t<dim) state[idx]=updated;
+  float q=t<dim?A(h*dim+t)*inversesqrt(float(dim)):0.0;
+  sumReduce(t,updated*q); if(t==0)put(h*dim+v,tmp[0]);
+ } else if(p.op==14) { // gated RMS norm, per SSM value head
+  float v=t<p.inDim?A(x*p.inDim+t):0.0;
+  sumReduce(t,v*v); float inv=inversesqrt(tmp[0]/float(p.inDim)+p.eps);
+  if(t<p.inDim) {float z=uintBitsToFloat(c[x*p.inDim+t]);put(x*p.inDim+t,v*inv*B(t)*z/(1.0+exp(-z)));}
+ } else if(p.op==15) { // split interleaved Q/gate and normalize Q per head
+  float v=t<p.headDim?A(x*p.headDim*2+t):0.0;
+  sumReduce(t,v*v);float inv=inversesqrt(tmp[0]/float(p.headDim)+p.eps);
+  if(t<p.headDim)put(x*p.headDim+t,v*inv*B(t));
+ } else if(p.op==16) { // partial NeoX RoPE: text positions equal in all MRoPE sections
+  if(t<p.outDim/2) {
+   uint idx=x*p.headDim+t;float angle=float(p.startPos)*pow(p.theta,-2.0*float(t)/float(p.outDim));
+   float av=A(idx),bv=A(idx+p.outDim/2),cs=cos(angle),sn=sin(angle);
+   put(idx,av*cs-bv*sn);put(idx+p.outDim/2,av*sn+bv*cs);
+  }
+ } else if(p.op==17) { // sigmoid attention gate from interleaved Q/gate projection
+  uint i=x*256+t;if(i>=p.inDim)return;
+  uint h=i/p.headDim,j=i%p.headDim;
+  put(i,A(i)/(1.0+exp(-B(h*p.headDim*2+p.headDim+j))));
+  } else if(p.op==18) {
+  uint i=x*256+t;if(i<p.inDim)put(i,0.0);
+ }
+}

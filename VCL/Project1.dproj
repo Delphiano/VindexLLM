@@ -161,10 +161,11 @@
             <FormType>dfm</FormType>
         </DCCReference>
         <DCCReference Include="UTest.Model.Gemma3.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Model.Llama.pas"/>
         <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
         <DCCReference Include="..\src\VindexLLM.Inference.pas"/>
-        <DCCReference Include="..\src\VindexLLM.Model.Mistral3.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Model.Llama.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Model.Ministral3.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Model.Qwen35.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

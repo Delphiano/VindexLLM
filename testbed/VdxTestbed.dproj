@@ -213,6 +213,7 @@
         <DCCReference Include="..\src\VindexLLM.Vulkan.pas"/>
         <DCCReference Include="..\src\VindexLLM.Common.pas"/>
         <DCCReference Include="..\src\VindexLLM.Model.Ministral3.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Model.Llama.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

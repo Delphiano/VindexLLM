@@ -60,7 +60,8 @@ uses
   VindexLLM.VirtualFile in '..\src\VindexLLM.VirtualFile.pas',
   VindexLLM.Vulkan in '..\src\VindexLLM.Vulkan.pas',
   VindexLLM.Common in '..\src\VindexLLM.Common.pas',
-  VindexLLM.Model.Ministral3 in '..\src\VindexLLM.Model.Ministral3.pas';
+  VindexLLM.Model.Ministral3 in '..\src\VindexLLM.Model.Ministral3.pas',
+  VindexLLM.Model.Llama in '..\src\VindexLLM.Model.Llama.pas';
 
 begin
   RunVdxTestbed();

@@ -682,7 +682,9 @@ begin
   FFusedGateUpDescPool := FCompute.CreateDescriptorPoolForStorage(1, 4);
   FFusedGateUpDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FFusedGateUpDescPool, FFusedGateUpDescLayout,
-    [LDummyBuf, LDummyBuf, FWorkBufA, FGateBuf]);
+    // Every descriptor must reference allocated memory, even when the fused
+    // shader does not read the first two bindings for a particular dispatch.
+    [FWorkBufA, FWorkBufA, FWorkBufA, FGateBuf]);
 
   if FErrors.HasFatal() then Exit;
 
@@ -992,7 +994,7 @@ begin
   FFusedGateUpBatchDescPool := FCompute.CreateDescriptorPoolForStorage(1, 4);
   FFusedGateUpBatchDescSet := FCompute.AllocateDescriptorSetForBuffers(
     FFusedGateUpBatchDescPool, FFusedGateUpDescLayout,
-    [LDummyBuf, LDummyBuf, FWorkMat, FGateMat]);
+    [FWorkMat, FWorkMat, FWorkMat, FGateMat]);
 
   if FErrors.HasFatal() then Exit;
 
