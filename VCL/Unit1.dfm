@@ -57,7 +57,7 @@ object Form1: TForm1
   object Label7: TLabel
     Left = 23
     Top = 182
-    Width = 89
+    Width = 94
     Height = 15
     Caption = 'Arquivo para RAG'
   end
@@ -69,6 +69,15 @@ object Form1: TForm1
     Caption = 'Carregar'
     TabOrder = 0
     OnClick = Button1Click
+  end
+  object btnSelecionarModelo: TButton
+    Left = 398
+    Top = 18
+    Width = 44
+    Height = 25
+    Caption = '...'
+    TabOrder = 18
+    OnClick = btnSelecionarModeloClick
   end
   object Memo1: TMemo
     Left = 560
@@ -116,7 +125,7 @@ object Form1: TForm1
   object Edit1: TEdit
     Left = 23
     Top = 19
-    Width = 450
+    Width = 374
     Height = 23
     TabOrder = 5
     Text = 'D:\Qwen3.5-0.8B-v2.Q4_K_M.gguf'
@@ -165,7 +174,7 @@ object Form1: TForm1
     Left = 23
     Top = 453
     Width = 531
-    Height = 300
+    Height = 260
     ScrollBars = ssVertical
     TabOrder = 11
   end
@@ -175,7 +184,7 @@ object Form1: TForm1
     Width = 121
     Height = 23
     TabOrder = 12
-    Text = '1000'
+    Text = '120'
   end
   object edRagFile: TEdit
     Left = 23

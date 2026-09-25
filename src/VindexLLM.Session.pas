@@ -128,6 +128,11 @@ type
     function Chat(const AUserMessage: string;
       const AMaxTokens: Integer = 256): string;
 
+    // Reset only the in-memory conversation state. Knowledge stored in the
+    // memory database (RAG documents and facts) is deliberately preserved.
+    // The next Chat() call is formatted and prefixed as the first message.
+    procedure ResetConversationContext();
+
     // Reset conversation state — clears the KV cache, purges all turns
     // from memory, and resets the turn index. The next Chat() call
     // behaves as a fresh session (BOS, system prompt injected again).
@@ -445,6 +450,16 @@ begin
   Inc(FTurnIndex, 1);
 
   Result := LResponse;
+end;
+
+procedure TVdxSession.ResetConversationContext();
+begin
+  if not IsLoaded() then
+    Exit;
+
+  FInference.ResetKVCache();
+  FTurnIndex := 0;
+  FLastUserMessage := '';
 end;
 
 procedure TVdxSession.ClearHistory();

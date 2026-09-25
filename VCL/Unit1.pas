@@ -1,4 +1,4 @@
-unit Unit1;
+﻿unit Unit1;
 
 interface
 
@@ -14,6 +14,7 @@ type
     Memo1: TMemo;
     Button2: TButton;
     Button3: TButton;
+    btnSelecionarModelo: TButton;
     mPrompt: TMemo;
     Edit1: TEdit;
     edTemperatura: TEdit;
@@ -41,6 +42,7 @@ type
     procedure Button3Click(Sender: TObject);
     procedure btnIndexRagFileClick(Sender: TObject);
     procedure chkUseRagClick(Sender: TObject);
+    procedure btnSelecionarModeloClick(Sender: TObject);
     procedure FormCreate(Sender: TObject);
   private
     const
@@ -79,6 +81,18 @@ begin
   OpenDialog1.Filter := 'Arquivos de texto|*.txt;*.md;*.csv;*.json;*.log|' +
     'Todos os arquivos|*.*';
   UpdateRagAvailability;
+end;
+
+procedure TForm1.btnSelecionarModeloClick(Sender: TObject);
+begin
+  OpenDialog1.Filter :=
+    'Modelos GGUF e cache Vindex|*.gguf;*.vdxcache|' +
+    'Modelos GGUF|*.gguf|' +
+    'Cache Vindex|*.vdxcache|' +
+    'Todos os arquivos|*.*';
+  OpenDialog1.FileName := Trim(Edit1.Text);
+  if OpenDialog1.Execute then
+    Edit1.Text := OpenDialog1.FileName;
 end;
 
 procedure TForm1.UpdateRagAvailability;
@@ -353,6 +367,8 @@ end;
 
 procedure TForm1.btnIndexRagFileClick(Sender: TObject);
 begin
+  OpenDialog1.Filter := 'Arquivos de texto|*.txt;*.md;*.csv;*.json;*.log|' +
+    'Todos os arquivos|*.*';
   if not OpenDialog1.Execute then
     Exit;
 
@@ -382,6 +398,10 @@ begin
   UserInput := Trim(mPrompt.Text);
   if UserInput = '' then
     Exit;
+
+  // Every click is an independent request. Preserve RAG knowledge while
+  // discarding the previous prompt/response from the model's KV cache.
+  LSession.ResetConversationContext;
 
   Config := TVdxSampler.DefaultConfig;
   Config.Temperature := StrToFloatDef(edTemperatura.Text, 0);

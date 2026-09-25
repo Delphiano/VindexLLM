@@ -41,6 +41,25 @@ float weight(uint row,uint col) {
   bool high=(byteA(off+side*16+lane)&(uint(1)<<(segment*4+pair)))!=0;
   return halfA(off+108)*float(scale)*float(int(q)-(high?0:4));
  }
+ if(p.typ==12) { // Q4_K: d, dmin, packed 6-bit scales/minima, nibbles
+  uint off=(e/256)*144, i=e%256, j=i/32;
+  uint sc, mn;
+  if(j<4) {sc=byteA(off+4+j)&63; mn=byteA(off+8+j)&63;}
+  else {sc=(byteA(off+8+j)&15)|((byteA(off+j)>>6)<<4);
+        mn=(byteA(off+8+j)>>4)|((byteA(off+4+j)>>6)<<4);}
+  uint q=(byteA(off+16+(i/64)*32+i%32) >> ((j%2)*4))&15;
+  return halfA(off)*float(sc*q)-halfA(off+2)*float(mn);
+ }
+ if(p.typ==13) { // Q5_K: Q4_K scales/minima plus one high bit per value
+  uint off=(e/256)*176, i=e%256, j=i/32;
+  uint sc, mn;
+  if(j<4) {sc=byteA(off+4+j)&63; mn=byteA(off+8+j)&63;}
+  else {sc=(byteA(off+8+j)&15)|((byteA(off+j)>>6)<<4);
+        mn=(byteA(off+8+j)>>4)|((byteA(off+4+j)>>6)<<4);}
+  uint q=(byteA(off+48+(i/64)*32+i%32) >> (4*((i/32)%2)))&15;
+  q|=((byteA(off+16+i%32)>>(i/32))&1)<<4;
+  return halfA(off)*float(sc*q)-halfA(off+2)*float(mn);
+ }
  // Q6_K: 256 values / 210 bytes. Scale bytes are signed int8.
  uint off=(e/256)*210, j=e%32, h=(e%256)/128, quadrant=(e%128)/32;
  uint lo=(byteA(off+h*64+j+(quadrant%2)*32) >> (quadrant>=2?4:0))&15;

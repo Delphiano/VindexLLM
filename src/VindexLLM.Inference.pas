@@ -328,6 +328,10 @@ begin
 end;
 
 function TVdxInference.RunUnembedding(): Integer;
+var
+  LI: Integer;
+  LValue: Single;
+  LInvalidCount: Integer;
 begin
   FModel.UnembedToLogits(FModel.LogitsBuffer);
 
@@ -335,6 +339,26 @@ begin
   FModel.Compute.DownloadFromBuffer(FModel.LogitsBuffer,
     FModel.LogitsVBuf.Memory,
     UInt64(FModel.VocabSize) * SizeOf(Single));
+
+  // A floating-point failure previously fell through to the sampler.  Since
+  // comparisons against NaN are always false, the sampler silently selected
+  // token 0, displayed by SentencePiece vocabularies as <unk>.  Fail with a
+  // useful diagnostic instead of presenting corrupted model output as text.
+  LInvalidCount := 0;
+  for LI := 0 to FModel.VocabSize - 1 do
+  begin
+    LValue := System.PSingle(PByte(FModel.LogitsVBuf.Memory) +
+      UInt64(LI) * SizeOf(Single))^;
+    if IsNan(LValue) or IsInfinite(LValue) then
+      Inc(LInvalidCount);
+  end;
+  if LInvalidCount <> 0 then
+  begin
+    FErrors.Add(esFatal, 'LOGITS',
+      'Inference produced %d invalid logits (NaN or infinity); generation was stopped',
+      [LInvalidCount]);
+    raise EConvertError.Create('Invalid logits produced by the GPU forward pass');
+  end;
 
   // Sample next token
   Result := FSampler.Process(System.PSingle(FModel.LogitsVBuf.Memory),

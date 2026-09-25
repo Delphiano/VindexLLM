@@ -17,6 +17,7 @@ interface
 
 uses
   System.SysUtils,
+  System.Classes,
   System.Generics.Collections,
   VindexLLM.Utils,
   VindexLLM.VirtualFile;
@@ -125,6 +126,12 @@ type
     // Computed offset where tensor data begins
     FTensorDataBase: PByte;
 
+    // A .vdxcache prepends a small container header to a byte-for-byte GGUF
+    // payload.  Keeping the payload mapped lets all tensor users retain their
+    // zero-copy access while the original GGUF can be absent.
+    FPayloadOffset: UInt64;
+    FPayloadSize: UInt64;
+
     // Cursor for sequential parsing
     FCursor: PByte;
 
@@ -159,6 +166,12 @@ type
     // Open and parse a GGUF file (memory-maps entire file)
     function Open(const AFilePath: string): Boolean;
 
+    // Writes a self-contained Vindex cache beside (or at ACachePath for) this
+    // currently open GGUF.  The cache is written through a temporary file so
+    // a cancelled or full-disk write never leaves a selectable partial cache.
+    function CreateCache(const ACachePath: string): Boolean;
+    class function DefaultCachePath(const AGGUFPath: string): string; static;
+
     // Close and unmap
     procedure Close();
 
@@ -192,9 +205,21 @@ function VdxGGMLTensorBytes(const AType: TVdxGGMLType;
 
 implementation
 
+uses
+  Winapi.Windows;
+
 const
   CGGUF_MAGIC          = $46554747; // 'GGUF' as little-endian uint32
   CGGUF_DEFAULT_ALIGN  = 32;
+  CVDXC_MAGIC          = $43584456; // 'VDXC' as little-endian uint32
+  CVDXC_VERSION        = 1;
+
+type
+  TVdxCacheHeader = packed record
+    Magic: UInt32;
+    Version: UInt32;
+    PayloadSize: UInt64;
+  end;
 
 { Helper functions }
 
@@ -337,6 +362,8 @@ begin
   FMetadataKVCount := 0;
   FAlignment := CGGUF_DEFAULT_ALIGN;
   FTensorDataBase := nil;
+  FPayloadOffset := 0;
+  FPayloadSize := 0;
   FCursor := nil;
 
   FMetadata := TDictionary<string, TVdxGGUFMetaValue>.Create();
@@ -372,6 +399,8 @@ begin
   FMetadataKVCount := 0;
   FAlignment := CGGUF_DEFAULT_ALIGN;
   FTensorDataBase := nil;
+  FPayloadOffset := 0;
+  FPayloadSize := 0;
   FCursor := nil;
 
   FMetadata.Clear();
@@ -380,12 +409,14 @@ begin
 end;
 
 function TVdxGGUFReader.Open(const AFilePath: string): Boolean;
+var
+  LCacheHeader: TVdxCacheHeader;
 begin
   Result := False;
   // Close any previously opened file
   Close();
 
-  Status('Opening GGUF file: %s', [AFilePath]);
+  Status('Opening model file: %s', [AFilePath]);
 
   // Memory-map the file via TVdxVirtualFile
   if not FVirtualFile.Open(AFilePath) then
@@ -398,8 +429,35 @@ begin
     [FVirtualFile.Size, FVirtualFile.Size / (1024.0 * 1024.0 * 1024.0)]);
   Status('File mapped into memory at $%p', [FVirtualFile.Memory]);
 
-  // Initialize cursor to start of file
-  FCursor := PByte(FVirtualFile.Memory);
+  FPayloadOffset := 0;
+  FPayloadSize := FVirtualFile.Size;
+  if FVirtualFile.Size >= SizeOf(LCacheHeader) then
+  begin
+    Move(PByte(FVirtualFile.Memory)^, LCacheHeader, SizeOf(LCacheHeader));
+    if LCacheHeader.Magic = CVDXC_MAGIC then
+    begin
+      if LCacheHeader.Version <> CVDXC_VERSION then
+      begin
+        FErrors.Add(esFatal, VDX_ERROR_GG_BAD_VERSION,
+          'Unsupported Vindex cache version: %d', [LCacheHeader.Version]);
+        Close();
+        Exit;
+      end;
+      if LCacheHeader.PayloadSize <> FVirtualFile.Size - SizeOf(LCacheHeader) then
+      begin
+        FErrors.Add(esFatal, VDX_ERROR_GG_PARSE,
+          'Invalid Vindex cache payload size');
+        Close();
+        Exit;
+      end;
+      FPayloadOffset := SizeOf(LCacheHeader);
+      FPayloadSize := LCacheHeader.PayloadSize;
+      Status('Opening self-contained Vindex cache (GGUF source not required)');
+    end;
+  end;
+
+  // Initialize cursor to the GGUF payload (at byte zero for a .gguf).
+  FCursor := PByte(FVirtualFile.Memory) + FPayloadOffset;
 
   try
     // Parse the file sequentially
@@ -433,17 +491,65 @@ begin
   end;
 end;
 
+class function TVdxGGUFReader.DefaultCachePath(const AGGUFPath: string): string;
+begin
+  Result := ChangeFileExt(AGGUFPath, '') + '.vdxcache';
+end;
+
+function TVdxGGUFReader.CreateCache(const ACachePath: string): Boolean;
+var
+  LOut: TFileStream;
+  LHeader: TVdxCacheHeader;
+  LTempPath: string;
+begin
+  Result := False;
+  if (not FVirtualFile.IsOpen) or (FPayloadSize = 0) then Exit;
+  if FPayloadOffset <> 0 then
+  begin
+    // A selected cache is already self-contained; do not create a cache of it.
+    Result := True;
+    Exit;
+  end;
+  LTempPath := ACachePath + '.tmp';
+  try
+    ForceDirectories(ExtractFilePath(ACachePath));
+    LHeader.Magic := CVDXC_MAGIC;
+    LHeader.Version := CVDXC_VERSION;
+    LHeader.PayloadSize := FPayloadSize;
+    LOut := TFileStream.Create(LTempPath, fmCreate);
+    try
+      LOut.WriteBuffer(LHeader, SizeOf(LHeader));
+      LOut.WriteBuffer(PByte(FVirtualFile.Memory)^, NativeInt(FPayloadSize));
+    finally
+      LOut.Free;
+    end;
+    if not MoveFileEx(PChar(LTempPath), PChar(ACachePath),
+      MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+      RaiseLastOSError;
+    Status('Model cache created: %s', [ACachePath]);
+    Result := True;
+  except
+    on E: Exception do
+    begin
+      if FileExists(LTempPath) then System.SysUtils.DeleteFile(LTempPath);
+      // Cache generation is an optimization; loading the selected GGUF must
+      // still succeed if the target directory is read-only or full.
+      Status('Model cache was not created: %s', [E.Message]);
+    end;
+  end;
+end;
+
 { Cursor bounds checking }
 
 procedure TVdxGGUFReader.CheckCursor(const ASize: NativeUInt);
 var
   LOffset: NativeUInt;
 begin
-  LOffset := NativeUInt(FCursor) - NativeUInt(FVirtualFile.Memory);
-  if LOffset + ASize > FVirtualFile.Size then
+  LOffset := NativeUInt(FCursor) - NativeUInt(FVirtualFile.Memory) - FPayloadOffset;
+  if LOffset + ASize > FPayloadSize then
     raise Exception.CreateFmt(
       'GGUF read past end of file: offset=%d, need=%d, filesize=%d',
-      [LOffset, ASize, FVirtualFile.Size]);
+      [LOffset, ASize, FPayloadSize]);
 end;
 
 { Cursor read helpers — all advance FCursor }
@@ -737,12 +843,12 @@ var
 begin
   // Current cursor position is right after all tensor info entries.
   // Tensor data starts at the next ALIGNMENT boundary from here.
-  LOffset := UInt64(FCursor) - UInt64(FVirtualFile.Memory);
+  LOffset := UInt64(FCursor) - UInt64(FVirtualFile.Memory) - FPayloadOffset;
 
   // Align: offset + (ALIGNMENT - (offset % ALIGNMENT)) % ALIGNMENT
   LAligned := LOffset + (UInt64(FAlignment) - (LOffset mod UInt64(FAlignment))) mod UInt64(FAlignment);
 
-  FTensorDataBase := PByte(FVirtualFile.Memory) + LAligned;
+  FTensorDataBase := PByte(FVirtualFile.Memory) + FPayloadOffset + LAligned;
 
   Status('Tensor data starts at file offset %d ($%x), alignment=%d',
     [LAligned, LAligned, FAlignment]);
@@ -772,7 +878,7 @@ end;
 
 function TVdxGGUFReader.GetFileSize(): UInt64;
 begin
-  Result := FVirtualFile.Size;
+  Result := FPayloadSize;
 end;
 
 { Public API — metadata access }
@@ -878,10 +984,10 @@ begin
     Exit;
   end;
 
-  LBaseOffset := UInt64(FTensorDataBase)-UInt64(FVirtualFile.Memory);
-  if LBaseOffset > FVirtualFile.Size then
+  LBaseOffset := UInt64(FTensorDataBase)-UInt64(FVirtualFile.Memory)-FPayloadOffset;
+  if LBaseOffset > FPayloadSize then
     raise ERangeError.Create('GGUF tensor data base exceeds file size');
-  LRemaining := FVirtualFile.Size-LBaseOffset;
+  LRemaining := FPayloadSize-LBaseOffset;
   if LInfo.DataOffset > LRemaining then
     raise ERangeError.Create('GGUF tensor offset exceeds file size: '+ATensorName);
   if ARequiredBytes > LRemaining-LInfo.DataOffset then

@@ -1346,6 +1346,12 @@ begin
     Exit;
   end;
 
+  // A GGUF selection creates a self-contained cache once.  Selecting the
+  // resulting .vdxcache on a later run maps that file directly and never
+  // opens the original GGUF.
+  if SameText(ExtractFileExt(AGGUFPath), '.gguf') then
+    LReader.CreateCache(TVdxGGUFReader.DefaultCachePath(AGGUFPath));
+
   // Detect architecture from GGUF metadata
   if LReader.HasMetadata('general.architecture') then
     LArch := LowerCase(LReader.GetMetadataString('general.architecture'))

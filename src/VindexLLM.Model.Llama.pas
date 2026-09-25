@@ -428,7 +428,11 @@ end;
 
 function TVdxLlamaModel.FormatPrompt(const APrompt: string): string;
 begin
-  Result := '<|user|>' + #10 + APrompt + #10 + '<|assistant|>' + #10;
+  // TinyLlama Chat v1.0 was trained with an end-of-turn token after each
+  // user message.  Omitting it makes the assistant header part of the user
+  // turn, which can produce degenerate output (commonly repeated <unk>).
+  Result := '<|user|>' + #10 + APrompt + '</s>' + #10 +
+    '<|assistant|>' + #10;
 end;
 
 function TVdxLlamaModel.GetStopTokenStrings(): TArray<string>;
