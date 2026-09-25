@@ -104,7 +104,10 @@ end;
 
 function TVdxQwen35Model.LoadModelConfig(const AReader: TVdxGGUFReader;
   const AMaxContext: Integer): Boolean;
-var P: string; NativeContext, TotalLayers, MTP: UInt32;
+var
+  P: string;
+  NativeContext, TotalLayers, MTP: UInt32;
+  LModelSize: string;
 begin
   inherited LoadModelConfig(AReader, AMaxContext);
   P := 'qwen35.';
@@ -118,7 +121,17 @@ begin
   FNumQHeads := AReader.GetMetadataUInt32(P+'attention.head_count');
   FNumKVHeads := AReader.GetMetadataUInt32(P+'attention.head_count_kv');
   FHeadDim := AReader.GetMetadataUInt32(P+'attention.key_length');
-  if (FHiddenDim<>1024) or (FFFNWidth<>3584) or (FNumQHeads<>8) or
+  if ((FHiddenDim=1024) and (FFFNWidth=3584)) then
+    LModelSize := '0.8B'
+  else if ((FHiddenDim=2048) and (FFFNWidth=6144)) then
+    LModelSize := '2B'
+  else
+    raise ENotSupportedException.CreateFmt(
+      'Unsupported Qwen3.5 dimensions: hidden=%d, FFN=%d ' +
+      '(supported profiles: 0.8B=1024/3584; 2B=2048/6144)',
+      [FHiddenDim, FFFNWidth]);
+
+  if (FNumQHeads<>8) or
     (FNumKVHeads<>2) or (FHeadDim<>256) or
     (AReader.GetMetadataUInt32(P+'attention.value_length')<>256) or
     (AReader.GetMetadataUInt32(P+'rope.dimension_count')<>64) or
@@ -128,7 +141,8 @@ begin
     (AReader.GetMetadataUInt32(P+'ssm.time_step_rank')<>16) or
     (AReader.GetMetadataUInt32(P+'ssm.inner_size')<>2048) or
     (AReader.GetMetadataUInt32(P+'full_attention_interval',4)<>4) then
-    raise ENotSupportedException.Create('Unsupported qwen35 dimensions: expected Qwen3.5-0.8B');
+    raise ENotSupportedException.Create(
+      'Unsupported Qwen3.5 attention/SSM configuration');
   NativeContext := AReader.GetMetadataUInt32(P+'context_length');
   if AMaxContext<=0 then FMaxSeqLen := Min(NativeContext,UInt32(4096))
   else FMaxSeqLen := Min(NativeContext,UInt32(AMaxContext));
@@ -141,7 +155,8 @@ begin
   FParams.Theta := AReader.GetMetadataFloat32(P+'rope.freq_base');
   if (FParams.Eps<=0) or (FParams.Theta<=1) then raise EConvertError.Create('Invalid Qwen35 norm/RoPE metadata');
   FBatchCount := 1; // recurrent state advances strictly in token order
-  Status('Native Qwen3.5-0.8B: 24 layers (18 SSM, 6 attention), context=%d; MTP skipped=%d',[FMaxSeqLen,MTP]);
+  Status('Native Qwen3.5-%s: 24 layers (18 SSM, 6 attention), context=%d; MTP skipped=%d',
+    [LModelSize, FMaxSeqLen, MTP]);
   Result := True;
 end;
 
@@ -206,7 +221,7 @@ begin
   end
   else if (Info.NumDimensions <> 2) or (Info.Dimensions[1] <> ARows) then
     raise EConvertError.Create('Incorrect tensor shape: '+AName);
-  if not (Info.TensorType in [gtF32,gtF16,gtQ4_0,gtQ4_1,gtQ8_0,gtQ3_K,gtQ4_K,gtQ6_K]) then
+  if not (Info.TensorType in [gtF32,gtF16,gtQ4_0,gtQ4_1,gtQ8_0,gtQ3_K,gtQ4_K,gtQ5_K,gtQ6_K]) then
     raise ENotSupportedException.CreateFmt('Unsupported tensor %s: %s',[AName,VdxGGMLTypeName(Info.TensorType)]);
   N := VdxGGMLTensorBytes(Info.TensorType,AWidth,ARows);
   Data := FReader.GetTensorDataPtr(AName,N);

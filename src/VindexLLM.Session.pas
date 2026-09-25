@@ -60,6 +60,8 @@ type
     FTurnIndex: Integer;           // tracks turn count for prompt assembly
     FLastUserMessage: string;      // raw user text for rebuild search queries
     FRetrievalConfig: TVdxRetrievalConfig;
+    FContextOnlyPrompt: Boolean;   // inject only retrieved text + user input
+    FRagProgressCallback: TVdxDocumentProgressCallback;
 
 
     // Caller-facing callbacks — stored here, forwarded to FInference
@@ -91,6 +93,8 @@ type
     constructor Create(); override;
     destructor Destroy(); override;
     procedure SetErrors(const AErrors: TVdxErrors); override;
+    procedure SetStatusCallback(const ACallback: TVdxStatusCallback;
+      const AUserData: Pointer = nil); override;
 
     // --- Lifecycle ---
     function LoadModel(
@@ -98,7 +102,8 @@ type
       const AMemoryDbPath: string;
       const AEmbedderPath: string;
       const AMaxContext: Integer = 2048;
-      const ARebuildAt: Integer = -1
+      const ARebuildAt: Integer = -1;
+      const AEmbedderMaxContext: Integer = 512
     ): Boolean;
 
     procedure UnloadModel();
@@ -109,6 +114,10 @@ type
     procedure SetSystemPrompt(const APrompt: string);
     procedure SetSamplerConfig(const AConfig: TVdxSamplerConfig);
     procedure SetRetrievalConfig(const AConfig: TVdxRetrievalConfig);
+    procedure SetContextOnlyPrompt(const AEnabled: Boolean);
+    procedure SetRagProgressCallback(
+      const ACallback: TVdxDocumentProgressCallback);
+    function IsRagReady(): Boolean;
     class function DefaultRetrievalConfig(): TVdxRetrievalConfig; static;
     procedure SetTokenCallback(const ACallback: TVdxTokenCallback;
       const AUserData: Pointer);
@@ -153,6 +162,8 @@ begin
   FTurnIndex := 0;
   FLastUserMessage := '';
   FRetrievalConfig := DefaultRetrievalConfig();
+  FContextOnlyPrompt := False;
+  FRagProgressCallback := nil;
   FTokenCallback := Default(TVdxCallback<TVdxTokenCallback>);
   FCancelCallback := Default(TVdxCallback<TVdxCancelCallback>);
 end;
@@ -171,9 +182,20 @@ begin
   if Assigned(FEmbedder) then FEmbedder.SetErrors(AErrors);
 end;
 
+procedure TVdxSession.SetStatusCallback(const ACallback: TVdxStatusCallback;
+  const AUserData: Pointer);
+begin
+  inherited SetStatusCallback(ACallback, AUserData);
+  if Assigned(FInference) then
+    FInference.SetStatusCallback(ACallback, AUserData);
+  if Assigned(FEmbedder) then
+    FEmbedder.SetStatusCallback(ACallback, AUserData);
+end;
+
 function TVdxSession.LoadModel(const AModelPath: string;
   const AMemoryDbPath: string; const AEmbedderPath: string;
-  const AMaxContext: Integer; const ARebuildAt: Integer): Boolean;
+  const AMaxContext: Integer; const ARebuildAt: Integer;
+  const AEmbedderMaxContext: Integer): Boolean;
 var
   LLoaded: Boolean;
   LOpened: Boolean;
@@ -194,15 +216,18 @@ begin
     Exit;
   end;
 
-  if AMemoryDbPath.Trim().IsEmpty() then
+  if (AEmbedderPath.Trim() <> '') and AMemoryDbPath.Trim().IsEmpty() then
   begin
-    FErrors.Add(esError, 'SESSION', 'Memory DB path must not be empty');
+    FErrors.Add(esError, 'SESSION',
+      'Memory DB path is required when an embedder is configured');
     Exit;
   end;
 
   // --- Create and load inference engine ---
   FInference := TVdxInference.Create();
   FInference.SetErrors(FErrors);
+  FInference.SetStatusCallback(FStatusCallback.Callback,
+    FStatusCallback.UserData);
   LLoaded := FInference.LoadModel(AModelPath, AMaxContext, ARebuildAt);
 
   if not LLoaded then
@@ -211,18 +236,21 @@ begin
     Exit;
   end;
 
-  // --- Create and open memory DB ---
-  FMemory := TVdxMemory.Create();
-  FMemory.SetErrors(FErrors);
-  LOpened := FMemory.OpenSession(AMemoryDbPath);
-  if not LOpened then
+  // --- Create and open memory DB only for a RAG-enabled session ---
+  if not AMemoryDbPath.Trim().IsEmpty() then
   begin
-    FErrors.Add(esError, 'SESSION', 'Failed to open memory DB: %s',
-      [AMemoryDbPath]);
-    FInference.UnloadModel();
-    FreeAndNil(FInference);
-    FreeAndNil(FMemory);
-    Exit;
+    FMemory := TVdxMemory.Create();
+    FMemory.SetErrors(FErrors);
+    LOpened := FMemory.OpenSession(AMemoryDbPath);
+    if not LOpened then
+    begin
+      FErrors.Add(esError, 'SESSION', 'Failed to open memory DB: %s',
+        [AMemoryDbPath]);
+      FInference.UnloadModel();
+      FreeAndNil(FInference);
+      FreeAndNil(FMemory);
+      Exit;
+    end;
   end;
 
   // --- Optionally create and load embedder ---
@@ -238,7 +266,9 @@ begin
     begin
       FEmbedder := TVdxEmbeddings.Create();
       FEmbedder.SetErrors(FErrors);
-      LLoaded := FEmbedder.LoadModel(AEmbedderPath);
+      FEmbedder.SetStatusCallback(FStatusCallback.Callback,
+        FStatusCallback.UserData);
+      LLoaded := FEmbedder.LoadModel(AEmbedderPath, AEmbedderMaxContext);
 
       if not LLoaded then
       begin
@@ -304,7 +334,7 @@ end;
 
 function TVdxSession.IsLoaded(): Boolean;
 begin
-  Result := Assigned(FInference) and Assigned(FMemory);
+  Result := Assigned(FInference);
 end;
 
 procedure TVdxSession.SetSystemPrompt(const APrompt: string);
@@ -321,6 +351,23 @@ end;
 procedure TVdxSession.SetRetrievalConfig(const AConfig: TVdxRetrievalConfig);
 begin
   FRetrievalConfig := AConfig;
+end;
+
+procedure TVdxSession.SetContextOnlyPrompt(const AEnabled: Boolean);
+begin
+  FContextOnlyPrompt := AEnabled;
+end;
+
+procedure TVdxSession.SetRagProgressCallback(
+  const ACallback: TVdxDocumentProgressCallback);
+begin
+  FRagProgressCallback := ACallback;
+end;
+
+function TVdxSession.IsRagReady(): Boolean;
+begin
+  Result := Assigned(FMemory) and Assigned(FEmbedder) and
+    FEmbedder.IsLoaded();
 end;
 
 class function TVdxSession.DefaultRetrievalConfig(): TVdxRetrievalConfig;
@@ -377,7 +424,8 @@ begin
   end;
 
   // 3. Log user turn to memory (after retrieval — see comment above)
-  FMemory.AppendTurn(CVdxMemRoleUser, AUserMessage, 0);
+  if Assigned(FMemory) then
+    FMemory.AppendTurn(CVdxMemRoleUser, AUserMessage, 0);
 
   // 4. Assemble prompt (system + context + user)
   LPrompt := FormatPrompt(AUserMessage, LContext);
@@ -405,7 +453,8 @@ begin
     Exit;
 
   FInference.ResetKVCache();
-  FMemory.PurgeAll();
+  if Assigned(FMemory) then
+    FMemory.PurgeAll();
   FTurnIndex := 0;
   FLastUserMessage := '';
 end;
@@ -416,13 +465,17 @@ var
   LContent: string;
 begin
   // Build the content to place inside the user turn.
-  // Layout: [system prompt] [context block] [user message]
+  // Context-only mode deliberately omits the system prompt: the VCL RAG
+  // workflow sends only the retrieved document text followed by user input.
   LContent := '';
 
-  // System prompt on first turn only — prefixed with 'System:' so the
-  // instruction-tuned model treats it as a directive, not user chat.
-  if (FInference.GetKVCachePosition() = 0) and (FSystemPrompt <> '') then
-    LContent := 'System: ' + FSystemPrompt + #10 + #10;
+  if not FContextOnlyPrompt then
+  begin
+    // System prompt on first turn only — prefixed with 'System:' so the
+    // instruction-tuned model treats it as a directive, not user chat.
+    if (FInference.GetKVCachePosition() = 0) and (FSystemPrompt <> '') then
+      LContent := 'System: ' + FSystemPrompt + #10 + #10;
+  end;
 
   // Injected RAG context (if any)
   if AContext <> '' then
@@ -452,11 +505,11 @@ begin
   // essentially dead weight. Cosine similarity against the embedder is
   // the whole point of having one, so defer to it exclusively.
   SetLength(Result, 0);
-  if (FEmbedder = nil) or (not FEmbedder.IsLoaded()) then
+  if (FMemory = nil) or (FEmbedder = nil) or (not FEmbedder.IsLoaded()) then
     Exit;
 
   try
-    LRaw := FMemory.SearchVector(AQuery, ATopK);
+    LRaw := FMemory.SearchVector(AQuery, ATopK, FContextOnlyPrompt);
   except
     SetLength(Result, 0);
     Exit;
@@ -494,9 +547,20 @@ begin
   // model understands whether a past statement came from the user or
   // from the assistant. Facts and document chunks use 'reference'
   // since they're neither speaker side.
-  Result := 'Relevant prior context:';
+  if FContextOnlyPrompt then
+    Result := ''
+  else
+    Result := 'Relevant prior context:';
   for LI := 0 to High(ATurns) do
   begin
+    if FContextOnlyPrompt then
+    begin
+      if Result <> '' then
+        Result := Result + #10 + #10;
+      Result := Result + ATurns[LI].Text;
+      Continue;
+    end;
+
     LRole := ATurns[LI].Role;
     if LRole = CVdxMemRoleUser then
       LLabel := 'user'
@@ -536,7 +600,7 @@ function TVdxSession.AddDocument(const ASource: string;
 begin
   if Assigned(FMemory) then
     Result := FMemory.AddDocument(ASource, ATitle, AText, AChunkTokens,
-      AOverlapTokens, APinned)
+      AOverlapTokens, APinned, FRagProgressCallback)
   else
     Result := -1;
 end;

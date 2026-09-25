@@ -64,6 +64,10 @@ const
 
 type
 
+  // Called after each document chunk is persisted and embedded.
+  TVdxDocumentProgressCallback = reference to procedure(
+    const ACompleted, ATotal: Integer);
+
   { TVdxMemoryTurn }
   TVdxMemoryTurn = record
     TurnId      : Int64;
@@ -175,8 +179,11 @@ type
     // current embedder's dim — indicates embedder-swap mid-DB, which
     // should never happen and is treated as a bug rather than handled
     // silently.
+    // When AKnowledgeOnly is True, only explicitly ingested facts and
+    // document chunks participate; conversational turns are excluded.
     function  SearchVector(const AQuery: string;
-      const ATopK: Integer): TArray<TVdxMemoryTurn>;
+      const ATopK: Integer;
+      const AKnowledgeOnly: Boolean = False): TArray<TVdxMemoryTurn>;
 
     // Inject a fact not tied to a conversational turn. Uses role 'fact'.
     // Participates in FTS5 and vector retrieval. Dedup applies.
@@ -200,10 +207,12 @@ type
     // exceeding AChunkTokens. AOverlapTokens trailing words carry over
     // between adjacent chunks. Both sizes are measured in whitespace-
     // delimited words (no BPE tokenizer at this layer). Returns the
-    // document id. Chunks inherit the document's pinned flag.
+    // document id. Chunks inherit the document's pinned flag. Re-ingesting
+    // the same source replaces its prior document and chunks.
     function  AddDocument(const ASource, ATitle, AText: string;
       const AChunkTokens, AOverlapTokens: Integer;
-      const APinned: Boolean = False): Int64;
+      const APinned: Boolean = False;
+      const AProgressCallback: TVdxDocumentProgressCallback = nil): Int64;
 
     // Delete a document and all its chunks. The cascade trigger on the
     // documents table auto-deletes related turns rows.
@@ -1084,7 +1093,7 @@ begin
 end;
 
 function TVdxMemory.SearchVector(const AQuery: string;
-  const ATopK: Integer): TArray<TVdxMemoryTurn>;
+  const ATopK: Integer; const AKnowledgeOnly: Boolean): TArray<TVdxMemoryTurn>;
 var
   LQuery: TFDQuery;
   LList: TList<TVdxMemoryTurn>;
@@ -1140,6 +1149,8 @@ begin
       '       pinned, embedding ' +
       'FROM turns ' +
       'WHERE embedding IS NOT NULL';
+    if AKnowledgeOnly then
+      LQuery.SQL.Add(' AND role IN (''fact'', ''chunk'')');
     LQuery.Open();
 
     while not LQuery.Eof do
@@ -1346,6 +1357,9 @@ begin
     Exit;
   end;
 
+  // Delete documents first so the document cascade keeps the FTS index in
+  // sync with their chunks. The second statement clears ordinary chat turns.
+  FConn.ExecSQL('DELETE FROM documents');
   FConn.ExecSQL('DELETE FROM turns');
   FNextTurnIndex := 0;
 end;
@@ -1374,7 +1388,8 @@ end;
 
 function TVdxMemory.AddDocument(const ASource, ATitle, AText: string;
   const AChunkTokens, AOverlapTokens: Integer;
-  const APinned: Boolean): Int64;
+  const APinned: Boolean;
+  const AProgressCallback: TVdxDocumentProgressCallback): Int64;
 var
   LDocQuery: TFDQuery;
   LUpdateQuery: TFDQuery;
@@ -1408,6 +1423,20 @@ begin
   begin
     FErrors.Add(esError, VDX_ERROR_MEM_OVERLAP_INVALID, RSMemOverlapInvalid);
     Exit;
+  end;
+
+  // A source identifies a document independently of its current contents.
+  // Re-indexing the same file must replace stale chunks, not append a second
+  // copy of the document to retrieval. The documents_ad trigger deletes the
+  // related turns and their FTS5 entries.
+  LDocQuery := TFDQuery.Create(nil);
+  try
+    LDocQuery.Connection := FConn;
+    LDocQuery.SQL.Text := 'DELETE FROM documents WHERE source = :src';
+    LDocQuery.ParamByName('src').AsString := ASource;
+    LDocQuery.ExecSQL();
+  finally
+    LDocQuery.Free();
   end;
 
   // Insert the parent document row.
@@ -1519,6 +1548,8 @@ begin
     LUpdateQuery := TFDQuery.Create(nil);
     try
       LUpdateQuery.Connection := FConn;
+      if Assigned(AProgressCallback) then
+        AProgressCallback(0, LChunks.Count);
       for LI := 0 to LChunks.Count - 1 do
       begin
         LChunkText := LChunks[LI];
@@ -1533,6 +1564,9 @@ begin
         LUpdateQuery.ParamByName('pin').AsInteger := LPinInt;
         LUpdateQuery.ParamByName('tid').AsLargeInt := LTurnId;
         LUpdateQuery.ExecSQL();
+
+        if Assigned(AProgressCallback) then
+          AProgressCallback(LI + 1, LChunks.Count);
       end;
     finally
       LUpdateQuery.Free();

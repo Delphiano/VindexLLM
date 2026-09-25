@@ -1,5 +1,8 @@
 # Native Qwen3.5-0.8B (text)
 
+Para definições dos termos de modelos, quantização, GPU e inferência usados
+nesta documentação, consulte o [dicionário de termos](../MODEL_GLOSSARY.md).
+
 `VindexLLM.Model.Qwen35.pas` registers `qwen35` through `VindexLLM.Inference`.
 The VCL application and console demo default to `D:\Qwen3.5-0.8B.gguf`.
 Inference runs in Delphi and embedded Vulkan compute shaders; no llama.cpp DLL,
@@ -27,6 +30,17 @@ From a Delphi Win64 command environment:
 # Optional shader rebuild (the compiled Qwen35.res is included):
 .\build.ps1 -RebuildShader -Glslang C:\path\to\glslang.exe
 ```
+
+### glslang and shaders
+
+`glslangValidator` is the reference compiler for GLSL shaders. In this project
+it compiles `dense.comp`, the Vulkan GPU compute shader, into `build/dense.spv`
+(SPIR-V), which is then embedded in `Qwen35.res` for the Delphi application.
+
+It is **not required to run** the already compiled application: the repository
+includes the compiled shader resource. It is only required when changing
+`dense.comp` and rebuilding the shader. Pass the full path to
+`glslangValidator.exe` with `-Glslang`, as in the command above.
 
 The application is written to `../../VCL/Win64/Debug/Project1.exe`.
 Open the VCL project, click **Carregar**, enter a prompt and click **Gerar**.

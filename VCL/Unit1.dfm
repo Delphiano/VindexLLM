@@ -1,7 +1,7 @@
 object Form1: TForm1
   Left = 0
   Top = 0
-  Caption = 'Form1'
+  Caption = 'VindexLLM RAG'
   ClientHeight = 777
   ClientWidth = 1118
   Color = clBtnFace
@@ -10,6 +10,7 @@ object Form1: TForm1
   Font.Height = -12
   Font.Name = 'Segoe UI'
   Font.Style = []
+  OnCreate = FormCreate
   TextHeight = 15
   object Label1: TLabel
     Left = 23
@@ -53,6 +54,13 @@ object Form1: TForm1
     Height = 15
     Caption = 'Max_tokens'
   end
+  object Label7: TLabel
+    Left = 23
+    Top = 182
+    Width = 89
+    Height = 15
+    Caption = 'Arquivo para RAG'
+  end
   object Button1: TButton
     Left = 479
     Top = 16
@@ -67,6 +75,7 @@ object Form1: TForm1
     Top = 17
     Width = 531
     Height = 696
+    ScrollBars = ssVertical
     TabOrder = 1
   end
   object Button2: TButton
@@ -79,19 +88,27 @@ object Form1: TForm1
     OnClick = Button2Click
   end
   object Button3: TButton
-    Left = 479
-    Top = 216
+    Left = 398
+    Top = 411
     Width = 75
-    Height = 249
+    Height = 25
     Caption = 'Gerar'
+    Enabled = False
     TabOrder = 3
     OnClick = Button3Click
   end
+  object ProgressBar1: TProgressBar
+    Left = 23
+    Top = 411
+    Width = 359
+    Height = 23
+    TabOrder = 17
+  end
   object mPrompt: TMemo
     Left = 23
-    Top = 216
+    Top = 280
     Width = 450
-    Height = 249
+    Height = 125
     Lines.Strings = (
       'Estava uma maravilha')
     TabOrder = 4
@@ -102,7 +119,7 @@ object Form1: TForm1
     Width = 450
     Height = 23
     TabOrder = 5
-    Text = 'D:\Qwen3.5-0.8B.gguf'
+    Text = 'D:\Qwen3.5-0.8B-v2.Q4_K_M.gguf'
   end
   object edTemperatura: TEdit
     Left = 96
@@ -146,9 +163,10 @@ object Form1: TForm1
   end
   object Memo2: TMemo
     Left = 23
-    Top = 480
+    Top = 453
     Width = 531
-    Height = 273
+    Height = 300
+    ScrollBars = ssVertical
     TabOrder = 11
   end
   object edMaxTokens: TEdit
@@ -158,5 +176,45 @@ object Form1: TForm1
     Height = 23
     TabOrder = 12
     Text = '1000'
+  end
+  object edRagFile: TEdit
+    Left = 23
+    Top = 202
+    Width = 355
+    Height = 23
+    TabOrder = 13
+  end
+  object btnIndexRagFile: TButton
+    Left = 384
+    Top = 201
+    Width = 89
+    Height = 25
+    Caption = 'Indexar arquivo'
+    TabOrder = 14
+    OnClick = btnIndexRagFileClick
+  end
+  object chkLoadExistingRag: TCheckBox
+    Left = 23
+    Top = 249
+    Width = 218
+    Height = 17
+    Caption = 'Nenhum RAG anterior encontrado'
+    Enabled = False
+    TabOrder = 15
+  end
+  object chkUseRag: TCheckBox
+    Left = 23
+    Top = 231
+    Width = 97
+    Height = 17
+    Caption = 'Usar RAG'
+    Checked = True
+    State = cbChecked
+    TabOrder = 16
+    OnClick = chkUseRagClick
+  end
+  object OpenDialog1: TOpenDialog
+    Left = 496
+    Top = 248
   end
 end

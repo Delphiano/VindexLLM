@@ -4,7 +4,7 @@
         <ProjectVersion>20.4</ProjectVersion>
         <FrameworkType>VCL</FrameworkType>
         <Base>True</Base>
-        <Config Condition="'$(Config)'==''">Debug</Config>
+        <Config Condition="'$(Config)'==''">Release</Config>
         <Platform Condition="'$(Platform)'==''">Win64</Platform>
         <ProjectName Condition="'$(ProjectName)'==''">Project1</ProjectName>
         <TargetedPlatforms>2097154</TargetedPlatforms>
@@ -160,7 +160,8 @@
             <Form>Form1</Form>
             <FormType>dfm</FormType>
         </DCCReference>
-        <DCCReference Include="UTest.Model.Gemma3.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Model.Gemma3.pas"/>
+        <DCCReference Include="..\src\VindexLLM.Session.pas"/>
         <DCCReference Include="..\src\VindexLLM.Tokenizer.pas"/>
         <DCCReference Include="..\src\VindexLLM.Inference.pas"/>
         <DCCReference Include="..\src\VindexLLM.Model.Llama.pas"/>

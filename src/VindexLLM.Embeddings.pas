@@ -78,7 +78,10 @@ type
     constructor Create(); override;
     destructor Destroy(); override;
 
-    function LoadModel(const AGGUFPath: string): Boolean;
+    // Embedding models run bidirectional attention over each batch. Keep a
+    // conservative default so they can share VRAM with the chat model.
+    function LoadModel(const AGGUFPath: string;
+      const AMaxContext: Integer = 512): Boolean;
     procedure UnloadModel();
     function IsLoaded(): Boolean;
 
@@ -314,7 +317,8 @@ begin
     'the final 768->3072->768 projection.', [Length(CNamePairs)]);
 end;
 
-function TVdxEmbeddings.LoadModel(const AGGUFPath: string): Boolean;
+function TVdxEmbeddings.LoadModel(const AGGUFPath: string;
+  const AMaxContext: Integer): Boolean;
 begin
   Result := False;
   FErrors.Clear();
@@ -327,9 +331,10 @@ begin
     Exit;
   end;
 
-  // Create model via factory — no max context override for embeddings,
-  // the model's native context length is used directly.
-  FModel := TVdxModel.LoadModel(AGGUFPath, 0,
+  // Embedding models use a full bidirectional batch, unlike generation's
+  // small prefill chunks. Cap the context to keep their matrices, KV cache,
+  // and staging buffer within the VRAM left by the selected chat model.
+  FModel := TVdxModel.LoadModel(AGGUFPath, AMaxContext,
     FStatusCallback.Callback, FStatusCallback.UserData);
   if FModel = nil then
   begin
