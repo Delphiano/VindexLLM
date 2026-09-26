@@ -38,6 +38,7 @@ const
 
 const
   DEFAULT_MAX_ERRORS = 1;
+  VDX_EXTENDED_STARTUPINFO_PRESENT = $00080000;
 
 type
 
@@ -927,7 +928,7 @@ begin
         // Create process - pass nil for environment to inherit from parent
         FillChar(LProcessInfo, SizeOf(LProcessInfo), 0);
         if not CreateProcessW(nil, PWideChar(LCmdLine), nil, nil, False,
-            EXTENDED_STARTUPINFO_PRESENT,
+            VDX_EXTENDED_STARTUPINFO_PRESENT,
             nil, LWorkDirPtr, LStartupInfoEx.StartupInfo, LProcessInfo) then
           Exit;
 
@@ -2498,7 +2499,7 @@ end;
 
 procedure Startup();
 begin
-  ReportMemoryLeaksOnShutdown := True;
+  //ReportMemoryLeaksOnShutdown := True;
   TVdxUtils.InitConsole();
   {$IFDEF VPR_LEAK_TRACK}
   TVdxBaseObject.InitLeakTracking();
